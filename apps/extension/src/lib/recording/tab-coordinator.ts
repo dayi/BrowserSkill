@@ -7,6 +7,7 @@ export interface TabActivation {
 
 export class RecordingTabCoordinator {
   readonly #navigationByTab = new Map<number, RecordingNavigationCursor>();
+  readonly #trackedTabs = new Set<number>();
   #activeTabId: number;
   #currentTabId: number;
   #activationRevision = 0;
@@ -14,6 +15,7 @@ export class RecordingTabCoordinator {
   constructor(initialTabId: number, initialUrl?: string) {
     this.#activeTabId = initialTabId;
     this.#currentTabId = initialTabId;
+    this.#trackedTabs.add(initialTabId);
     this.#navigationByTab.set(initialTabId, {
       currentUrl: initialUrl,
       pendingNavigation: false,
@@ -26,6 +28,24 @@ export class RecordingTabCoordinator {
 
   get currentTabId(): number {
     return this.#currentTabId;
+  }
+
+  get tabIds(): readonly number[] {
+    return [...this.#trackedTabs];
+  }
+
+  hasTab(tabId: number): boolean {
+    return this.#trackedTabs.has(tabId);
+  }
+
+  trackTab(tabId: number, initialUrl?: string): void {
+    this.#trackedTabs.add(tabId);
+    this.navigation(tabId, initialUrl);
+  }
+
+  forgetTab(tabId: number): void {
+    this.#trackedTabs.delete(tabId);
+    this.#navigationByTab.delete(tabId);
   }
 
   noteActivation(tabId: number): TabActivation {
@@ -41,6 +61,7 @@ export class RecordingTabCoordinator {
   }
 
   commit(tabId: number, currentUrl?: string): void {
+    this.trackTab(tabId, currentUrl);
     if (currentUrl !== undefined) this.navigation(tabId).currentUrl = currentUrl;
     this.#currentTabId = tabId;
   }

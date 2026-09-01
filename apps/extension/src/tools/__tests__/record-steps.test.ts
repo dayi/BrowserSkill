@@ -54,25 +54,40 @@ function chromeEvent<T extends (...args: never[]) => unknown>() {
 function installChrome() {
   const runtimeOnMessage = chromeEvent<RuntimeListener>();
   const tabsOnActivated = chromeEvent<(activeInfo: chrome.tabs.TabActiveInfo) => unknown>();
+  const tabsOnCreated = chromeEvent<(tab: chrome.tabs.Tab) => unknown>();
+  const tabsOnRemoved =
+    chromeEvent<(tabId: number, removeInfo: chrome.tabs.TabRemoveInfo) => unknown>();
   const webNavigationOnCompleted =
     chromeEvent<(details: chrome.webNavigation.WebNavigationFramedCallbackDetails) => unknown>();
   const webNavigationOnCommitted =
     chromeEvent<
       (details: chrome.webNavigation.WebNavigationTransitionCallbackDetails) => unknown
     >();
+  const webNavigationOnCreatedNavigationTarget =
+    chromeEvent<(details: chrome.webNavigation.WebNavigationSourceCallbackDetails) => unknown>();
   vi.stubGlobal("chrome", {
     runtime: { onMessage: runtimeOnMessage },
     tabs: {
       onActivated: tabsOnActivated,
-      onCreated: chromeEvent(),
+      onCreated: tabsOnCreated,
+      onRemoved: tabsOnRemoved,
       onUpdated: chromeEvent(),
     },
     webNavigation: {
       onCompleted: webNavigationOnCompleted,
       onCommitted: webNavigationOnCommitted,
+      onCreatedNavigationTarget: webNavigationOnCreatedNavigationTarget,
     },
   });
-  return { runtimeOnMessage, tabsOnActivated, webNavigationOnCompleted, webNavigationOnCommitted };
+  return {
+    runtimeOnMessage,
+    tabsOnActivated,
+    tabsOnCreated,
+    tabsOnRemoved,
+    webNavigationOnCompleted,
+    webNavigationOnCommitted,
+    webNavigationOnCreatedNavigationTarget,
+  };
 }
 
 function fakeManager() {
@@ -1290,6 +1305,90 @@ describe("recorded user steps reach the exported trace", () => {
     expect(stateUrl(clicks[0]!.state)).toBe(secondUrl);
     expect(stateUrl(switches[1]!.result.state)).toBe(START_URL);
     expect(stateUrl(clicks[1]!.state)).toBe(START_URL);
+  });
+
+  it("records actions in a popup opened in a separate window", async () => {
+    const chromeApi = installChrome();
+    const manager = fakeManager();
+    const popupUrl = "https://example.com/popup";
+    const tabsApi = makeMultiTabsApi([
+      {
+        id: TAB_ID,
+        windowId: AGENT_WINDOW_ID,
+        active: true,
+        status: "complete",
+        url: START_URL,
+      } as chrome.tabs.Tab,
+      {
+        id: 6,
+        windowId: 200,
+        active: false,
+        status: "complete",
+        url: popupUrl,
+        openerTabId: TAB_ID,
+      } as chrome.tabs.Tab,
+    ]);
+    const deps = {
+      tabsApi,
+      sendToTab: vi.fn(async (_tabId: number, _message: unknown) => ({ ok: true })),
+      cdp: makeFakeCdp(undefined, {
+        treesByTab: {
+          [TAB_ID]: axTree("Parent page", ["Open popup"]),
+          6: axTree("Popup page", ["Popup action"]),
+        },
+      }),
+    };
+    let requestId = "";
+    deps.sendToTab.mockImplementation(async (_tabId, message) => {
+      const typed = message as { type?: string; requestId?: string };
+      if (typed.type === RECORD_START && typed.requestId) requestId = typed.requestId;
+      return { ok: true };
+    });
+
+    await handleRecordStart(manager, RECORD_START_V3, deps);
+    attachRecordStepListener(deps);
+
+    // This is the event that identifies window.open()/target=_blank as a
+    // child of the currently recorded page, even when Chrome creates it in a
+    // different browser window.
+    chromeApi.webNavigationOnCreatedNavigationTarget.emit({
+      sourceTabId: TAB_ID,
+      sourceFrameId: 0,
+      tabId: 6,
+      url: popupUrl,
+    } as chrome.webNavigation.WebNavigationSourceCallbackDetails);
+    tabsApi.activate(6);
+    chromeApi.tabsOnActivated.emit({ tabId: 6, windowId: 200 });
+    await settleWait();
+
+    runtimeOnMessageEmit(
+      chromeApi,
+      requestId,
+      {
+        op: "click",
+        page_url: popupUrl,
+        target: { role: "button", name: "Popup action", tag: "button" },
+      },
+      6,
+    );
+    await settleWait();
+
+    const stopped = await handleRecordStop(manager, { session_id: "abcd" }, deps);
+    const trace = asTraceV3((stopped as RecordStopResult).trace);
+    const stateUrl = (stateId: string) => trace.states.find((state) => state.id === stateId)?.url;
+    const switchStep = trace.steps.find((step) => step.op === "switch_tab");
+    const popupClick = trace.steps.find(
+      (step) => step.op === "click" && stateUrl(step.state) === popupUrl,
+    );
+    expect(switchStep).toBeTruthy();
+    expect(stateUrl(switchStep!.state)).toBe(START_URL);
+    expect(stateUrl(switchStep!.result.state)).toBe(popupUrl);
+    expect(popupClick).toBeTruthy();
+    expect(deps.sendToTab).toHaveBeenCalledWith(6, {
+      type: RECORD_START,
+      requestId,
+      startedAtMs: expect.any(Number),
+    });
   });
 
   it("keeps switch_tab internal when the v3 caller did not advertise support", async () => {

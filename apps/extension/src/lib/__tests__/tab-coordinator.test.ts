@@ -36,4 +36,20 @@ describe("RecordingTabCoordinator", () => {
     expect(tabs.currentTabId).toBe(5);
     expect(tabs.navigation(5).currentUrl).toBe("https://example.com/new");
   });
+
+  it("tracks popup tabs independently of their browser window", () => {
+    const tabs = new RecordingTabCoordinator(4);
+
+    tabs.trackTab(9, "https://example.com/popup");
+
+    expect(tabs.hasTab(4)).toBe(true);
+    expect(tabs.hasTab(9)).toBe(true);
+    expect(tabs.tabIds).toEqual([4, 9]);
+    expect(tabs.navigation(9).currentUrl).toBe("https://example.com/popup");
+
+    tabs.forgetTab(9);
+
+    expect(tabs.hasTab(9)).toBe(false);
+    expect(tabs.tabIds).toEqual([4]);
+  });
 });

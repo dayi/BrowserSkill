@@ -438,7 +438,7 @@ export function attachRecordFinishListener(deps: RecordDeps = getDefaultDeps()):
 
 function findRecordingByTabId(tabId: number): ActiveRecording | null {
   for (const recording of recordings.values()) {
-    if (recording.tabs.currentTabId === tabId && !recording.settled) return recording;
+    if (recording.tabs.hasTab(tabId) && !recording.settled) return recording;
   }
   return null;
 }
@@ -475,6 +475,7 @@ async function clearRearmTimersForRecording(
   recording: ActiveRecording,
   deps: RecordDeps,
 ): Promise<void> {
+  for (const tabId of recording.tabs.tabIds) clearRearmTimer(tabId);
   clearRearmTimer(recording.tabs.currentTabId);
   try {
     const tabs = await deps.tabsApi.query({ windowId: recording.agentWindowId });
@@ -494,12 +495,13 @@ async function stopRecordingOnAllAgentTabs(
     throw new Error("failed to flush one or more recording documents");
   }
   const stopMsg: RecordStopMessage = { type: RECORD_STOP, requestId: recording.requestId };
-  let tabIds = [recording.tabs.currentTabId];
+  let tabIds = [recording.tabs.currentTabId, ...recording.tabs.tabIds];
   try {
     const tabs = await deps.tabsApi.query({ windowId: recording.agentWindowId });
     tabIds = [
       ...new Set([
         recording.tabs.currentTabId,
+        ...recording.tabs.tabIds,
         ...tabs.flatMap((tab) => (typeof tab.id === "number" ? [tab.id] : [])),
       ]),
     ];
@@ -594,7 +596,11 @@ export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): ()
     const windowId = tab.windowId;
     if (tabId === undefined || windowId === undefined) return;
     for (const recording of recordings.values()) {
-      if (isRecordingFinishing(recording) || recording.agentWindowId !== windowId) continue;
+      if (isRecordingFinishing(recording)) continue;
+      const openedByRecordedTab =
+        tab.openerTabId !== undefined && recording.tabs.hasTab(tab.openerTabId);
+      if (recording.agentWindowId !== windowId && !openedByRecordedTab) continue;
+      recording.tabs.trackTab(tabId, tab.url);
       scheduleRearmForTab(tabId, deps);
       return;
     }
@@ -602,19 +608,35 @@ export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): ()
 
   const onActivated = (activeInfo: chrome.tabs.TabActiveInfo) => {
     for (const recording of recordings.values()) {
-      if (isRecordingFinishing(recording) || recording.agentWindowId !== activeInfo.windowId)
+      if (isRecordingFinishing(recording)) continue;
+      if (
+        recording.agentWindowId !== activeInfo.windowId &&
+        !recording.tabs.hasTab(activeInfo.tabId)
+      ) {
         continue;
+      }
+      recording.tabs.trackTab(activeInfo.tabId);
       const activation = recording.tabs.noteActivation(activeInfo.tabId);
       scheduleRearmForTab(activeInfo.tabId, deps, activation);
       return;
     }
   };
 
+  const onRemoved = (tabId: number) => {
+    for (const recording of recordings.values()) {
+      if (!recording.tabs.hasTab(tabId)) continue;
+      recording.tabs.forgetTab(tabId);
+      clearRearmTimer(tabId);
+    }
+  };
+
   chrome.tabs.onCreated.addListener(onCreated);
   chrome.tabs.onActivated.addListener(onActivated);
+  chrome.tabs.onRemoved.addListener(onRemoved);
   return () => {
     chrome.tabs.onCreated.removeListener(onCreated);
     chrome.tabs.onActivated.removeListener(onActivated);
+    chrome.tabs.onRemoved.removeListener(onRemoved);
   };
 }
 
@@ -668,6 +690,16 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
     })();
   };
 
+  const onCreatedNavigationTarget = (
+    details: chrome.webNavigation.WebNavigationSourceCallbackDetails,
+  ) => {
+    const recording = findRecordingByTabId(details.sourceTabId);
+    if (!recording || isRecordingFinishing(recording)) return;
+    recording.tabs.trackTab(details.tabId, details.url);
+    scheduleRearmForTab(details.tabId, deps);
+  };
+  const createdNavigationTargetEvent = chrome.webNavigation?.onCreatedNavigationTarget;
+
   if (chrome.webNavigation?.onCompleted) {
     const completedListener = (
       details: chrome.webNavigation.WebNavigationFramedCallbackDetails,
@@ -689,9 +721,11 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
     };
     chrome.webNavigation.onCompleted.addListener(completedListener);
     chrome.webNavigation.onCommitted?.addListener(committedListener);
+    createdNavigationTargetEvent?.addListener(onCreatedNavigationTarget);
     return () => {
       chrome.webNavigation.onCompleted.removeListener(completedListener);
       chrome.webNavigation.onCommitted?.removeListener(committedListener);
+      createdNavigationTargetEvent?.removeListener(onCreatedNavigationTarget);
     };
   }
 
@@ -700,7 +734,11 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
     onMainFrameComplete(tabId, info.url);
   };
   chrome.tabs.onUpdated.addListener(listener);
-  return () => chrome.tabs.onUpdated.removeListener(listener);
+  createdNavigationTargetEvent?.addListener(onCreatedNavigationTarget);
+  return () => {
+    chrome.tabs.onUpdated.removeListener(listener);
+    createdNavigationTargetEvent?.removeListener(onCreatedNavigationTarget);
+  };
 }
 
 const MAX_FINISH_DRAIN_ROUNDS = 10;
