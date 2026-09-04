@@ -57,6 +57,7 @@ import {
 } from "./shared";
 
 interface ActiveRecording {
+  sessionId: string;
   requestId: string;
   tabs: RecordingTabCoordinator;
   agentWindowId: number;
@@ -73,6 +74,7 @@ interface ActiveRecording {
   settled: boolean;
   finishAttempt: Promise<RecordedTrace | null> | null;
   observation: RecordingObservationRuntime | null;
+  cdp?: CdpRunner;
   stoppedBy: StopReason;
   /** Navigation callbacks tracked from event receipt through action enqueue. */
   navigationCallbacks: Set<Promise<void>>;
@@ -247,12 +249,22 @@ async function activateRecordingTab(
   recording: ActiveRecording,
   targetTabId: number,
 ): Promise<void> {
+  if (!recording.tabs.hasTab(targetTabId)) return;
   const previousTabId = recording.tabs.currentTabId;
   if (targetTabId === previousTabId) return;
+  if (previousTabId === null) {
+    recording.tabs.commit(targetTabId);
+    return;
+  }
 
   const transition = recording.observation
     ? await recording.observation.captureTabTransition(previousTabId, targetTabId)
     : {};
+  // tabs.onRemoved is synchronous and may run while observation capture is in
+  // flight. Do not emit a transition or commit a tab that disappeared.
+  if (!recording.tabs.hasTab(targetTabId) || recording.tabs.currentTabId !== previousTabId) {
+    return;
+  }
   const { targetUrl, ...stateLinks } = transition;
   const draft: Extract<RecordingDraftStep, { op: "switch_tab" }> = {
     op: "switch_tab",
@@ -295,6 +307,21 @@ export interface RecordDeps {
 export type RecordRuntimeDeps = Omit<RecordDeps, "frameCoordinator" | "signal"> & {
   frameCoordinator: NonNullable<RecordDeps["frameCoordinator"]>;
 };
+
+function trackRecordingTab(
+  recording: ActiveRecording,
+  tabId: number,
+  deps: RecordDeps,
+  initialUrl?: string,
+  openerTabId?: number,
+): boolean {
+  const alreadyTracked = recording.tabs.hasTab(tabId);
+  if (!recording.tabs.trackTab(tabId, initialUrl, openerTabId)) return false;
+  if (!alreadyTracked) {
+    (recording.cdp ?? deps.cdp)?.trackSessionTab?.(recording.sessionId, tabId);
+  }
+  return true;
+}
 
 let defaultDeps: RecordDeps | null = null;
 function getDefaultDeps(): RecordDeps {
@@ -374,7 +401,10 @@ export function attachRecordStepListener(deps: RecordDeps = getDefaultDeps()): (
         : undefined;
       if (deps.frameCoordinator && !source) return false;
       const sourceTabId = source?.tabId ?? sender.tab?.id ?? recording.tabs.currentTabId;
-      const sourceWasActive = sender.tab?.active ?? sourceTabId === recording.tabs.activeTabId;
+      if (sourceTabId === null) return false;
+      // Tab.active is scoped to a window. Multiple windows can each report an
+      // active tab, so only the coordinator's focused-window tab is logical.
+      const sourceWasActive = sourceTabId === recording.tabs.activeTabId;
       const producerKey = source
         ? `${source.tabId}:${source.documentId}:${source.producerId}`
         : `${sourceTabId}:${message.producerId}`;
@@ -396,8 +426,9 @@ export function attachRecordStepListener(deps: RecordDeps = getDefaultDeps()): (
       enqueueRecordingAction(recording, async () => {
         if (sourceTabId !== recording.tabs.currentTabId) {
           if (!sourceWasActive) return;
-          if (sourceTabId !== recording.tabs.activeTabId)
+          if (sourceTabId !== recording.tabs.activeTabId) {
             recording.tabs.noteActivation(sourceTabId);
+          }
           await activateRecordingTab(recording, sourceTabId);
         }
         await recording.observation?.flushRedirects(sourceTabId);
@@ -476,7 +507,8 @@ async function clearRearmTimersForRecording(
   deps: RecordDeps,
 ): Promise<void> {
   for (const tabId of recording.tabs.tabIds) clearRearmTimer(tabId);
-  clearRearmTimer(recording.tabs.currentTabId);
+  const currentTabId = recording.tabs.currentTabId;
+  if (currentTabId !== null) clearRearmTimer(currentTabId);
   try {
     const tabs = await deps.tabsApi.query({ windowId: recording.agentWindowId });
     for (const tab of tabs) {
@@ -491,16 +523,24 @@ async function stopRecordingOnAllAgentTabs(
   recording: ActiveRecording,
   deps: RecordDeps,
 ): Promise<void> {
-  if (deps.frameCoordinator && !(await deps.frameCoordinator.stop(recording.requestId))) {
-    throw new Error("failed to flush one or more recording documents");
+  if (deps.frameCoordinator) {
+    if (recording.tabs.tabIds.length === 0) {
+      // Every content-script document is already gone, so there is nothing to
+      // flush and waiting for stale ports can only turn a clean close into a
+      // stop failure. Accepted RECORD_STEP work is drained below.
+      deps.frameCoordinator.cancel(recording.requestId);
+    } else if (!(await deps.frameCoordinator.stop(recording.requestId))) {
+      throw new Error("failed to flush one or more recording documents");
+    }
   }
   const stopMsg: RecordStopMessage = { type: RECORD_STOP, requestId: recording.requestId };
-  let tabIds = [recording.tabs.currentTabId, ...recording.tabs.tabIds];
+  const requiredTabId = recording.tabs.currentTabId;
+  let tabIds = [...recording.tabs.tabIds];
   try {
     const tabs = await deps.tabsApi.query({ windowId: recording.agentWindowId });
     tabIds = [
       ...new Set([
-        recording.tabs.currentTabId,
+        ...(requiredTabId === null ? [] : [requiredTabId]),
         ...recording.tabs.tabIds,
         ...tabs.flatMap((tab) => (typeof tab.id === "number" ? [tab.id] : [])),
       ]),
@@ -512,11 +552,11 @@ async function stopRecordingOnAllAgentTabs(
   for (const tabId of tabIds) {
     try {
       const response = await deps.sendToTab(tabId, stopMsg);
-      if (tabId === recording.tabs.currentTabId && !isRecordStartAck(response)) {
+      if (tabId === requiredTabId && !isRecordStartAck(response)) {
         throw new Error("content script did not confirm recorded steps");
       }
     } catch {
-      if (tabId === recording.tabs.currentTabId) {
+      if (tabId === requiredTabId && !recording.tabs.wasRemoved(tabId)) {
         throw new Error("failed to flush recorded steps");
       }
     }
@@ -542,7 +582,7 @@ async function rearmRecording(
   // already hides the control chrome while activeRecord is set.
   const isFinishing = () => isRecordingFinishing(recording);
   for (let attempt = 0; attempt < RECORD_REARM_MAX_ATTEMPTS; attempt += 1) {
-    if (isFinishing()) return false;
+    if (isFinishing() || !recording.tabs.hasTab(targetTabId)) return false;
     const startMsg: RecordStartMessage = {
       type: RECORD_START,
       requestId: recording.requestId,
@@ -554,7 +594,7 @@ async function rearmRecording(
         if (!frameStarted) throw new Error("recording document did not start");
       }
       await sendRecordStartWithAck(targetTabId, startMsg, deps.sendToTab, isFinishing);
-      if (isFinishing()) return false;
+      if (isFinishing() || !recording.tabs.hasTab(targetTabId)) return false;
       if (activation) {
         if (!recording.tabs.isLatest(activation)) return true;
         await enqueueRecordingAction(recording, async () => {
@@ -591,6 +631,9 @@ function scheduleRearmForTab(tabId: number, deps: RecordDeps, activation?: TabAc
 }
 
 export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): () => void {
+  let focusedWindowId: number | null = null;
+  let focusRevision = 0;
+
   const onCreated = (tab: chrome.tabs.Tab) => {
     const tabId = tab.id;
     const windowId = tab.windowId;
@@ -600,7 +643,7 @@ export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): ()
       const openedByRecordedTab =
         tab.openerTabId !== undefined && recording.tabs.hasTab(tab.openerTabId);
       if (recording.agentWindowId !== windowId && !openedByRecordedTab) continue;
-      recording.tabs.trackTab(tabId, tab.url);
+      if (!trackRecordingTab(recording, tabId, deps, tab.url, tab.openerTabId)) continue;
       scheduleRearmForTab(tabId, deps);
       return;
     }
@@ -615,8 +658,11 @@ export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): ()
       ) {
         continue;
       }
-      recording.tabs.trackTab(activeInfo.tabId);
-      const activation = recording.tabs.noteActivation(activeInfo.tabId);
+      if (!trackRecordingTab(recording, activeInfo.tabId, deps)) continue;
+      const activation =
+        focusedWindowId === null || focusedWindowId === activeInfo.windowId
+          ? (recording.tabs.noteActivation(activeInfo.tabId) ?? undefined)
+          : undefined;
       scheduleRearmForTab(activeInfo.tabId, deps, activation);
       return;
     }
@@ -625,18 +671,60 @@ export function attachRecordTabListener(deps: RecordDeps = getDefaultDeps()): ()
   const onRemoved = (tabId: number) => {
     for (const recording of recordings.values()) {
       if (!recording.tabs.hasTab(tabId)) continue;
-      recording.tabs.forgetTab(tabId);
+      const focusedTabId = recording.tabs.activeTabId;
+      recording.tabs.forgetTab(
+        tabId,
+        focusedTabId !== null && focusedTabId !== tabId ? focusedTabId : undefined,
+      );
       clearRearmTimer(tabId);
     }
   };
 
+  const onFocusChanged = (windowId: number) => {
+    focusRevision += 1;
+    const revision = focusRevision;
+    if (windowId === chrome.windows.WINDOW_ID_NONE) {
+      focusedWindowId = null;
+      return;
+    }
+    focusedWindowId = windowId;
+    void (async () => {
+      let activeTab: chrome.tabs.Tab | undefined;
+      try {
+        activeTab = (await deps.tabsApi.query({ active: true, windowId }))[0];
+      } catch {
+        return;
+      }
+      if (revision !== focusRevision || typeof activeTab?.id !== "number") return;
+      for (const recording of recordings.values()) {
+        if (isRecordingFinishing(recording)) continue;
+        if (recording.agentWindowId !== windowId && !recording.tabs.hasTab(activeTab.id)) {
+          continue;
+        }
+        if (
+          !trackRecordingTab(recording, activeTab.id, deps, activeTab.url, activeTab.openerTabId)
+        ) {
+          continue;
+        }
+        const activation = recording.tabs.noteActivation(activeTab.id);
+        if (activation) scheduleRearmForTab(activeTab.id, deps, activation);
+        return;
+      }
+    })();
+  };
+
+  const focusChangedEvent = chrome.windows?.onFocusChanged;
+
   chrome.tabs.onCreated.addListener(onCreated);
   chrome.tabs.onActivated.addListener(onActivated);
   chrome.tabs.onRemoved.addListener(onRemoved);
+  focusChangedEvent?.addListener(onFocusChanged);
   return () => {
+    focusRevision += 1;
     chrome.tabs.onCreated.removeListener(onCreated);
     chrome.tabs.onActivated.removeListener(onActivated);
     chrome.tabs.onRemoved.removeListener(onRemoved);
+    focusChangedEvent?.removeListener(onFocusChanged);
   };
 }
 
@@ -695,7 +783,9 @@ export function attachRecordNavigationListener(deps: RecordDeps = getDefaultDeps
   ) => {
     const recording = findRecordingByTabId(details.sourceTabId);
     if (!recording || isRecordingFinishing(recording)) return;
-    recording.tabs.trackTab(details.tabId, details.url);
+    if (!trackRecordingTab(recording, details.tabId, deps, details.url, details.sourceTabId)) {
+      return;
+    }
     scheduleRearmForTab(details.tabId, deps);
   };
   const createdNavigationTargetEvent = chrome.webNavigation?.onCreatedNavigationTarget;
@@ -779,7 +869,14 @@ export function attachRecordQueryListener(deps: RecordDeps = getDefaultDeps()): 
         sendResponse({ active: false });
         return;
       }
-      const activation = sender.tab?.active ? recording.tabs.noteActivation(tabId) : undefined;
+      if (!trackRecordingTab(recording, tabId, deps, sender.tab?.url, sender.tab?.openerTabId)) {
+        sendResponse({ active: false });
+        return;
+      }
+      const activation =
+        recording.tabs.activeTabId === tabId
+          ? (recording.tabs.noteActivation(tabId) ?? undefined)
+          : undefined;
       await rearmRecording(recording, tabId, deps, activation);
       sendResponse({
         active: true,
@@ -896,6 +993,7 @@ export async function handleRecordStart(
   const maxPageTokens = params.max_page_tokens;
   const redactValues = params.redact_values ?? false;
   recordings.set(params.session_id, {
+    sessionId: params.session_id,
     requestId,
     tabs: new RecordingTabCoordinator(target.tabId, navigateUrl),
     agentWindowId: ctx.agentWindowId,
@@ -920,6 +1018,7 @@ export async function handleRecordStart(
             redactValues,
           })
         : null,
+    ...(deps.cdp ? { cdp: deps.cdp } : {}),
     stoppedBy: "user_finish",
     navigationCallbacks: new Set(),
     acceptingNavigation: true,

@@ -57,6 +57,7 @@ function installChrome() {
   const tabsOnCreated = chromeEvent<(tab: chrome.tabs.Tab) => unknown>();
   const tabsOnRemoved =
     chromeEvent<(tabId: number, removeInfo: chrome.tabs.TabRemoveInfo) => unknown>();
+  const windowsOnFocusChanged = chromeEvent<(windowId: number) => unknown>();
   const webNavigationOnCompleted =
     chromeEvent<(details: chrome.webNavigation.WebNavigationFramedCallbackDetails) => unknown>();
   const webNavigationOnCommitted =
@@ -73,6 +74,10 @@ function installChrome() {
       onRemoved: tabsOnRemoved,
       onUpdated: chromeEvent(),
     },
+    windows: {
+      WINDOW_ID_NONE: -1,
+      onFocusChanged: windowsOnFocusChanged,
+    },
     webNavigation: {
       onCompleted: webNavigationOnCompleted,
       onCommitted: webNavigationOnCommitted,
@@ -84,6 +89,7 @@ function installChrome() {
     tabsOnActivated,
     tabsOnCreated,
     tabsOnRemoved,
+    windowsOnFocusChanged,
     webNavigationOnCompleted,
     webNavigationOnCommitted,
     webNavigationOnCreatedNavigationTarget,
@@ -133,6 +139,7 @@ type FakeCdp = CdpRunner & {
   setCaptureFailure(failing: boolean): void;
   /** Keep the page reporting DOM churn for this long, as a slow render would. */
   setBusyFor(ms: number): void;
+  trackSessionTab: ReturnType<typeof vi.fn<(sessionId: string, tabId: number) => void>>;
 };
 
 /** Long enough that the recorder treats the page as done reacting. */
@@ -196,7 +203,7 @@ function makeFakeCdp(
     setBusyFor: (ms: number) => {
       busyUntil = Date.now() + ms;
     },
-    trackSessionTab: () => {},
+    trackSessionTab: vi.fn<(sessionId: string, tabId: number) => void>(),
     onEvent: (handler: EventListener) => {
       events.push(handler);
       return {
@@ -243,7 +250,11 @@ function makeMultiTabsApi(tabs: chrome.tabs.Tab[]) {
           (query.active === undefined || tab.active === query.active),
       ),
     activate(tabId: number) {
-      for (const tab of byId.values()) tab.active = tab.id === tabId;
+      const target = byId.get(tabId);
+      if (!target) throw new Error(`tab ${tabId} closed`);
+      for (const tab of byId.values()) {
+        if (tab.windowId === target.windowId) tab.active = tab.id === tabId;
+      }
     },
     goTo(tabId: number, url: string, title: string) {
       const tab = byId.get(tabId);
@@ -1395,6 +1406,7 @@ describe("recorded user steps reach the exported trace", () => {
         ([tabId, message]) => tabId === 6 && (message as { type?: string }).type === RECORD_START,
       ),
     ).toHaveLength(1);
+    expect(deps.cdp.trackSessionTab).toHaveBeenCalledWith("abcd", 6);
   });
 
   it("ignores an unrelated tab opened in another window", async () => {
@@ -1503,6 +1515,202 @@ describe("recorded user steps reach the exported trace", () => {
         ([tabId, message]) => tabId === 6 && (message as { type?: string }).type === RECORD_STOP,
       ),
     ).toBe(false);
+  });
+
+  it("keeps an accepted popup step when the popup closes before its queue runs", async () => {
+    const chromeApi = installChrome();
+    const manager = fakeManager();
+    const popupUrl = "https://example.com/popup";
+    const tabsApi = makeMultiTabsApi([
+      {
+        id: TAB_ID,
+        windowId: AGENT_WINDOW_ID,
+        active: true,
+        status: "complete",
+        url: START_URL,
+      } as chrome.tabs.Tab,
+      {
+        id: 6,
+        windowId: 200,
+        active: true,
+        status: "complete",
+        url: popupUrl,
+        openerTabId: TAB_ID,
+      } as chrome.tabs.Tab,
+    ]);
+    let requestId = "";
+    const sendToTab = vi.fn(async (tabId: number, message: unknown) => {
+      const typed = message as { type?: string; requestId?: string };
+      if (typed.type === RECORD_START && typed.requestId) requestId = typed.requestId;
+      if (tabId === 6 && typed.type === RECORD_STOP) throw new Error("tab 6 closed");
+      return { ok: true };
+    });
+    const deps = {
+      tabsApi,
+      sendToTab,
+      cdp: makeFakeCdp(undefined, {
+        treesByTab: {
+          [TAB_ID]: axTree("Parent page", ["Open popup"]),
+          6: axTree("Popup page", ["Close popup"]),
+        },
+      }),
+    };
+
+    await handleRecordStart(manager, RECORD_START_V3, deps);
+    attachRecordStepListener(deps);
+    chromeApi.tabsOnCreated.emit({
+      id: 6,
+      windowId: 200,
+      active: true,
+      openerTabId: TAB_ID,
+      url: popupUrl,
+    } as chrome.tabs.Tab);
+    chromeApi.tabsOnActivated.emit({ tabId: 6, windowId: 200 });
+    await settleWait();
+
+    const ack = runtimeOnMessageEmit(
+      chromeApi,
+      requestId,
+      {
+        op: "click",
+        page_url: popupUrl,
+        target: { role: "button", name: "Close popup", tag: "button" },
+      },
+      6,
+    );
+    tabsApi.close(6);
+    chromeApi.tabsOnRemoved.emit(6, { windowId: 200, isWindowClosing: true });
+
+    expect(ack).toHaveBeenCalledWith({ ok: true, sequence: 1 });
+    const stopped = await handleRecordStop(manager, { session_id: "abcd" }, deps);
+    const trace = asTraceV3((stopped as RecordStopResult).trace);
+    expect(trace.steps.some((step) => step.op === "click")).toBe(true);
+    expect(
+      sendToTab.mock.calls.some(
+        ([tabId, message]) => tabId === 6 && (message as { type?: string }).type === RECORD_STOP,
+      ),
+    ).toBe(false);
+  });
+
+  it("stops successfully after the only recording tab is closed", async () => {
+    const chromeApi = installChrome();
+    const manager = fakeManager();
+    const tabsApi = makeMultiTabsApi([
+      {
+        id: TAB_ID,
+        windowId: AGENT_WINDOW_ID,
+        active: true,
+        status: "complete",
+        url: START_URL,
+      } as chrome.tabs.Tab,
+    ]);
+    const sendToTab = vi.fn(async (tabId: number, message: unknown) => {
+      if (tabId === TAB_ID && (message as { type?: string }).type === RECORD_STOP) {
+        throw new Error("tab 4 closed");
+      }
+      return { ok: true };
+    });
+    const frameCoordinator = {
+      begin: vi.fn(),
+      armTab: vi.fn(async () => true),
+      sourceFor: vi.fn(() => null),
+      stop: vi.fn(async () => true),
+      cancel: vi.fn(),
+    };
+    const deps = { tabsApi, sendToTab, cdp: makeFakeCdp(), frameCoordinator };
+
+    await handleRecordStart(manager, RECORD_START_V3, deps);
+    tabsApi.close(TAB_ID);
+    chromeApi.tabsOnRemoved.emit(TAB_ID, {
+      windowId: AGENT_WINDOW_ID,
+      isWindowClosing: true,
+    });
+
+    const stopped = await handleRecordStop(manager, { session_id: "abcd" }, deps);
+    expect(stopped).toHaveProperty("trace");
+    expect(frameCoordinator.cancel).toHaveBeenCalledOnce();
+    expect(frameCoordinator.stop).not.toHaveBeenCalled();
+    expect(
+      sendToTab.mock.calls.some(
+        ([tabId, message]) =>
+          tabId === TAB_ID && (message as { type?: string }).type === RECORD_STOP,
+      ),
+    ).toBe(false);
+  });
+
+  it("uses focused-window changes when multiple windows each have an active tab", async () => {
+    const chromeApi = installChrome();
+    const manager = fakeManager();
+    const popupUrl = "https://example.com/popup";
+    const tabsApi = makeMultiTabsApi([
+      {
+        id: TAB_ID,
+        windowId: AGENT_WINDOW_ID,
+        active: true,
+        status: "complete",
+        url: START_URL,
+      } as chrome.tabs.Tab,
+      {
+        id: 6,
+        windowId: 200,
+        active: true,
+        status: "complete",
+        url: popupUrl,
+        openerTabId: TAB_ID,
+      } as chrome.tabs.Tab,
+    ]);
+    let requestId = "";
+    const sendToTab = vi.fn(async (_tabId: number, message: unknown) => {
+      const typed = message as { type?: string; requestId?: string };
+      if (typed.type === RECORD_START && typed.requestId) requestId = typed.requestId;
+      return { ok: true };
+    });
+    const deps = {
+      tabsApi,
+      sendToTab,
+      cdp: makeFakeCdp(undefined, {
+        treesByTab: {
+          [TAB_ID]: axTree("Parent page", ["Parent action"]),
+          6: axTree("Popup page", ["Popup action"]),
+        },
+      }),
+    };
+
+    await handleRecordStart(manager, RECORD_START_V3, deps);
+    attachRecordStepListener(deps);
+    chromeApi.tabsOnCreated.emit({
+      id: 6,
+      windowId: 200,
+      active: true,
+      openerTabId: TAB_ID,
+      url: popupUrl,
+    } as chrome.tabs.Tab);
+    chromeApi.windowsOnFocusChanged.emit(200);
+    await settleWait();
+    chromeApi.windowsOnFocusChanged.emit(AGENT_WINDOW_ID);
+    await settleWait();
+
+    runtimeOnMessageEmit(
+      chromeApi,
+      requestId,
+      {
+        op: "click",
+        page_url: popupUrl,
+        target: { role: "button", name: "Popup action", tag: "button" },
+      },
+      6,
+      true,
+    );
+    runtimeOnMessageEmit(chromeApi, requestId, {
+      op: "click",
+      page_url: START_URL,
+      target: { role: "button", name: "Parent action", tag: "button" },
+    });
+
+    const stopped = await handleRecordStop(manager, { session_id: "abcd" }, deps);
+    const trace = asTraceV3((stopped as RecordStopResult).trace);
+    expect(trace.steps.filter((step) => step.op === "switch_tab")).toHaveLength(2);
+    expect(trace.steps.filter((step) => step.op === "click")).toHaveLength(1);
   });
 
   it("keeps switch_tab internal when the v3 caller did not advertise support", async () => {

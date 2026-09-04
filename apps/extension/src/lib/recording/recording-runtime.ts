@@ -230,17 +230,19 @@ export class RecordingObservationRuntime {
     for (const context of this.#contexts.values()) await this.#flushContext(context);
   }
 
-  async settleTrailing(tabId: number, drafts: RecordingDraftStep[]): Promise<void> {
-    const context = this.#context(tabId);
-    if (context.pendingCapture) await Promise.allSettled([context.pendingCapture.promise]);
-    if (!context.session.cursor.lastSettled) {
-      try {
-        await this.captureInitial(tabId);
-      } catch {
-        // The trace may remain observation-free when CDP is unavailable.
+  async settleTrailing(tabId: number | null, drafts: RecordingDraftStep[]): Promise<void> {
+    if (tabId !== null) {
+      const context = this.#context(tabId);
+      if (context.pendingCapture) await Promise.allSettled([context.pendingCapture.promise]);
+      if (!context.session.cursor.lastSettled) {
+        try {
+          await this.captureInitial(tabId);
+        } catch {
+          // The trace may remain observation-free when CDP is unavailable.
+        }
       }
+      await context.settle.settleTrailing(drafts);
     }
-    await context.settle.settleTrailing(drafts);
     inferMissingPostStates(drafts);
   }
 
