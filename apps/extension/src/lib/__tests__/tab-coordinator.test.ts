@@ -47,9 +47,14 @@ describe("RecordingTabCoordinator", () => {
     expect(tabs.tabIds).toEqual([4, 9]);
     expect(tabs.navigation(9).currentUrl).toBe("https://example.com/popup");
 
+    tabs.noteActivation(9);
+    tabs.commit(9);
+
     tabs.forgetTab(9);
 
     expect(tabs.hasTab(9)).toBe(false);
     expect(tabs.tabIds).toEqual([4]);
+    expect(tabs.activeTabId).toBe(4);
+    expect(tabs.currentTabId).toBe(4);
   });
 });

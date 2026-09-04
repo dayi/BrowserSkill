@@ -44,8 +44,15 @@ export class RecordingTabCoordinator {
   }
 
   forgetTab(tabId: number): void {
-    this.#trackedTabs.delete(tabId);
+    if (!this.#trackedTabs.delete(tabId)) return;
     this.#navigationByTab.delete(tabId);
+    const fallbackTabId = this.#trackedTabs.values().next().value;
+    if (fallbackTabId === undefined) return;
+    if (this.#currentTabId === tabId) this.#currentTabId = fallbackTabId;
+    if (this.#activeTabId === tabId) {
+      this.#activeTabId = fallbackTabId;
+      this.#activationRevision += 1;
+    }
   }
 
   noteActivation(tabId: number): TabActivation {

@@ -250,6 +250,9 @@ function makeMultiTabsApi(tabs: chrome.tabs.Tab[]) {
       if (!tab) throw new Error(`tab ${tabId} closed`);
       Object.assign(tab, { url, title });
     },
+    close(tabId: number) {
+      byId.delete(tabId);
+    },
   };
 }
 
@@ -1348,9 +1351,12 @@ describe("recorded user steps reach the exported trace", () => {
     await handleRecordStart(manager, RECORD_START_V3, deps);
     attachRecordStepListener(deps);
 
-    // This is the event that identifies window.open()/target=_blank as a
-    // child of the currently recorded page, even when Chrome creates it in a
-    // different browser window.
+    chromeApi.tabsOnCreated.emit({
+      id: 6,
+      windowId: 200,
+      openerTabId: TAB_ID,
+      url: popupUrl,
+    } as chrome.tabs.Tab);
     chromeApi.webNavigationOnCreatedNavigationTarget.emit({
       sourceTabId: TAB_ID,
       sourceFrameId: 0,
@@ -1384,11 +1390,119 @@ describe("recorded user steps reach the exported trace", () => {
     expect(stateUrl(switchStep!.state)).toBe(START_URL);
     expect(stateUrl(switchStep!.result.state)).toBe(popupUrl);
     expect(popupClick).toBeTruthy();
-    expect(deps.sendToTab).toHaveBeenCalledWith(6, {
-      type: RECORD_START,
-      requestId,
-      startedAtMs: expect.any(Number),
+    expect(
+      deps.sendToTab.mock.calls.filter(
+        ([tabId, message]) => tabId === 6 && (message as { type?: string }).type === RECORD_START,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("ignores an unrelated tab opened in another window", async () => {
+    const chromeApi = installChrome();
+    const manager = fakeManager();
+    const unrelatedUrl = "https://example.net/unrelated";
+    const tabsApi = makeMultiTabsApi([
+      {
+        id: TAB_ID,
+        windowId: AGENT_WINDOW_ID,
+        active: true,
+        status: "complete",
+        url: START_URL,
+      } as chrome.tabs.Tab,
+      {
+        id: 7,
+        windowId: 300,
+        active: true,
+        status: "complete",
+        url: unrelatedUrl,
+      } as chrome.tabs.Tab,
+    ]);
+    const deps = {
+      tabsApi,
+      sendToTab: vi.fn(async (_tabId: number, _message: unknown) => ({ ok: true })),
+      cdp: makeFakeCdp(),
+    };
+
+    await handleRecordStart(manager, RECORD_START_V3, deps);
+    chromeApi.tabsOnCreated.emit({
+      id: 7,
+      windowId: 300,
+      url: unrelatedUrl,
+    } as chrome.tabs.Tab);
+    chromeApi.tabsOnActivated.emit({ tabId: 7, windowId: 300 });
+    await settleWait();
+
+    const stopped = await handleRecordStop(manager, { session_id: "abcd" }, deps);
+    const trace = asTraceV3((stopped as RecordStopResult).trace);
+    expect(trace.steps.some((step) => step.op === "switch_tab")).toBe(false);
+    expect(
+      deps.sendToTab.mock.calls.some(
+        ([tabId, message]) => tabId === 7 && (message as { type?: string }).type === RECORD_START,
+      ),
+    ).toBe(false);
+  });
+
+  it("stops successfully after the active popup is closed", async () => {
+    const chromeApi = installChrome();
+    const manager = fakeManager();
+    const popupUrl = "https://example.com/popup";
+    const tabsApi = makeMultiTabsApi([
+      {
+        id: TAB_ID,
+        windowId: AGENT_WINDOW_ID,
+        active: true,
+        status: "complete",
+        url: START_URL,
+      } as chrome.tabs.Tab,
+      {
+        id: 6,
+        windowId: 200,
+        active: false,
+        status: "complete",
+        url: popupUrl,
+        openerTabId: TAB_ID,
+      } as chrome.tabs.Tab,
+    ]);
+    const sendToTab = vi.fn(async (tabId: number, message: unknown) => {
+      if (tabId === 6 && (message as { type?: string }).type === RECORD_STOP) {
+        throw new Error("tab 6 closed");
+      }
+      return { ok: true };
     });
+    const deps = {
+      tabsApi,
+      sendToTab,
+      cdp: makeFakeCdp(undefined, {
+        treesByTab: {
+          [TAB_ID]: axTree("Parent page", ["Open popup"]),
+          6: axTree("Popup page"),
+        },
+      }),
+    };
+
+    await handleRecordStart(manager, RECORD_START_V3, deps);
+    chromeApi.tabsOnCreated.emit({
+      id: 6,
+      windowId: 200,
+      openerTabId: TAB_ID,
+      url: popupUrl,
+    } as chrome.tabs.Tab);
+    tabsApi.activate(6);
+    chromeApi.tabsOnActivated.emit({ tabId: 6, windowId: 200 });
+    await settleWait();
+
+    tabsApi.close(6);
+    chromeApi.tabsOnRemoved.emit(6, { windowId: 200, isWindowClosing: true });
+
+    const stopped = await handleRecordStop(manager, { session_id: "abcd" }, deps);
+    expect(asTraceV3((stopped as RecordStopResult).trace).steps).toContainEqual(
+      expect.objectContaining({ op: "switch_tab" }),
+    );
+    expect(
+      sendToTab.mock.calls.some(
+        ([tabId, message]) => tabId === 6 && (message as { type?: string }).type === RECORD_STOP,
+      ),
+    ).toBe(false);
   });
 
   it("keeps switch_tab internal when the v3 caller did not advertise support", async () => {
