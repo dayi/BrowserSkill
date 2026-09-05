@@ -32,7 +32,7 @@ export interface DocumentSettleScope {
   frameId?: string;
 }
 
-type SettleOutcome = "quiet" | "timeout" | "cancelled";
+export type SettleOutcome = "quiet" | "timeout" | "cancelled";
 
 interface QuietProbe {
   idleMs: number;
@@ -109,19 +109,32 @@ async function readQuietProbe(
   }
 }
 
+/**
+ * Wait until a document is mutation-quiet. Timing overrides are optional so
+ * trace-v3 callers retain their exact behavior while trace-v4 can compose the
+ * DOM probe with network activity under a larger dynamic deadline.
+ */
 export async function waitForDocumentSettled(
   cdp: CdpRunner,
   scope: DocumentSettleScope,
-  options: { signal?: AbortSignal } = {},
+  options: {
+    signal?: AbortSignal;
+    minMs?: number;
+    quietMs?: number;
+    maxMs?: number;
+    pollMs?: number;
+  } = {},
 ): Promise<SettleOutcome> {
   const startedAt = Date.now();
-  const floor = startedAt + SETTLE_MIN_MS;
-  const deadline = startedAt + SETTLE_MAX_MS;
+  const floor = startedAt + (options.minMs ?? SETTLE_MIN_MS);
+  const deadline = startedAt + (options.maxMs ?? SETTLE_MAX_MS);
+  const quietMs = options.quietMs ?? SETTLE_QUIET_MS;
+  const pollMs = options.pollMs ?? SETTLE_POLL_MS;
   const context: ProbeContext = {};
 
   for (;;) {
     if (options.signal?.aborted) return "cancelled";
-    await sleep(SETTLE_POLL_MS, options.signal);
+    await sleep(pollMs, options.signal);
     if (options.signal?.aborted) return "cancelled";
 
     const probe = await readQuietProbe(cdp, scope, context);
@@ -129,6 +142,6 @@ export async function waitForDocumentSettled(
     if (now < floor) continue;
     if (now >= deadline) return "timeout";
     if (!probe || probe.readyState === "loading") continue;
-    if (probe.idleMs >= SETTLE_QUIET_MS) return "quiet";
+    if (probe.idleMs >= quietMs) return "quiet";
   }
 }
