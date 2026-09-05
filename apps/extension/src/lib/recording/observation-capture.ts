@@ -20,6 +20,7 @@ export interface CapturedRecordingObservation {
   title?: string;
   vomText: string;
   truncated: boolean;
+  capturedAtMs: number;
 }
 
 export interface RegisteredObservation {
@@ -27,6 +28,7 @@ export interface RegisteredObservation {
   rootFrameId: string;
   index: ObservationNodeIndex;
   url: string;
+  capturedAtMs: number;
 }
 
 export interface RecordingDocumentScope {
@@ -136,5 +138,6 @@ export async function captureRecordingObservation(input: {
     title,
     vomText: captured.text,
     truncated: captured.truncated,
+    capturedAtMs: Date.now(),
   };
 }
