@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -12,6 +12,7 @@ use crate::cli::error::CliError;
 pub(super) struct ExportMeta {
     pub(super) states_dir: Option<PathBuf>,
     pub(super) trace_version: u32,
+    /// True when the extension fell back to legacy v2 without page states.
     pub(super) v2_fallback: bool,
 }
 
@@ -47,7 +48,7 @@ pub(super) fn validate_record_output(path: &Path) -> Result<(), CliError> {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) if looks_like_json_output(path) => Err(legacy_json_output_error(path)),
         Ok(_) => Err(CliError::Local(anyhow::anyhow!(
-            "--output {} is not a directory; use `--output trace`",
+            "--output {} is not a directory; state-linked traces write `<dir>/trace.json` and `<dir>/states/`. Use `--output trace`.",
             path.display()
         ))),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -63,15 +64,7 @@ pub(super) fn validate_record_output(path: &Path) -> Result<(), CliError> {
     }
 }
 
-fn is_canonical_state_id(id: &str) -> bool {
-    let Some(number) = id.strip_prefix('s') else {
-        return false;
-    };
-    let mut digits = number.bytes();
-    matches!(digits.next(), Some(b'1'..=b'9')) && digits.all(|byte| byte.is_ascii_digit())
-}
-
-fn validate_directory(path: &Path, description: &str) -> Result<(), CliError> {
+fn validate_bundle_directory(path: &Path, description: &str) -> Result<(), CliError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Local(anyhow::anyhow!(
             "{description} {} must not be a symlink",
@@ -103,93 +96,239 @@ fn validate_replaceable_file(path: &Path, description: &str) -> Result<(), CliEr
     }
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    let parent = path.parent().ok_or_else(|| {
-        CliError::Local(anyhow::anyhow!("output path {} has no parent", path.display()))
-    })?;
-    let id = uuid::Uuid::new_v4();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("record-output");
-    let tmp = parent.join(format!(".{file_name}.{id}.tmp"));
-    let backup = parent.join(format!(".{file_name}.{id}.bak"));
+fn acquire_export_lock(output_dir: &Path) -> Result<std::fs::File, CliError> {
+    validate_record_output(output_dir)?;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create output dir {}", output_dir.display()))
+        .map_err(CliError::Local)?;
+    let lock_path = output_dir.join(".bsk-record-export.lock");
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open export lock {}", lock_path.display()))
+        .map_err(CliError::Local)?;
+    fs2::FileExt::lock_exclusive(&lock_file)
+        .with_context(|| format!("lock export bundle {}", output_dir.display()))
+        .map_err(CliError::Local)?;
+    Ok(lock_file)
+}
 
-    let write_result: Result<(), CliError> = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("create staged file {}", tmp.display()))
-            .map_err(CliError::Local)?;
-        file.write_all(bytes)
-            .with_context(|| format!("write staged file {}", tmp.display()))
-            .map_err(CliError::Local)?;
-        file.sync_all()
-            .with_context(|| format!("sync staged file {}", tmp.display()))
-            .map_err(CliError::Local)?;
-        Ok(())
-    })();
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&tmp);
+fn is_canonical_state_id(id: &str) -> bool {
+    let Some(number) = id.strip_prefix('s') else {
+        return false;
+    };
+    let mut digits = number.bytes();
+    matches!(digits.next(), Some(b'1'..=b'9')) && digits.all(|byte| byte.is_ascii_digit())
+}
+
+fn is_generated_state_name(name: &str) -> bool {
+    name.strip_suffix(".txt").is_some_and(is_canonical_state_id)
+}
+
+fn commit_staged_file(staged: &Path, target: &Path, backup: &Path) -> io::Result<Option<PathBuf>> {
+    let old_file = match fs::symlink_metadata(target) {
+        Ok(_) => {
+            fs::rename(target, backup)?;
+            Some(backup.to_path_buf())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+
+    if let Err(err) = fs::rename(staged, target) {
+        if let Some(old_file) = old_file.as_deref() {
+            if let Err(restore_err) = fs::rename(old_file, target) {
+                return Err(io::Error::new(
+                    restore_err.kind(),
+                    format!(
+                        "{err}; additionally failed to restore {}: {restore_err}",
+                        target.display()
+                    ),
+                ));
+            }
+        }
         return Err(err);
     }
+    Ok(old_file)
+}
 
-    let had_old = match fs::rename(path, &backup) {
-        Ok(()) => true,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+fn rollback_installed_files(installed: &[(PathBuf, Option<PathBuf>)]) -> io::Result<()> {
+    let mut rollback_error = None;
+    for (target, backup) in installed.iter().rev() {
+        match fs::remove_file(target) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                rollback_error.get_or_insert(err);
+                continue;
+            }
+        }
+        if let Some(backup) = backup {
+            if let Err(err) = fs::rename(backup, target) {
+                rollback_error.get_or_insert(err);
+            }
+        }
+    }
+    match rollback_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn restore_staged_stale_states(staged: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    let mut restore_error = None;
+    for (original, backup) in staged.iter().rev() {
+        if let Err(err) = fs::rename(backup, original) {
+            restore_error.get_or_insert(err);
+        }
+    }
+    match restore_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Move stale generated state files aside so stale cleanup participates in the
+/// same rollback boundary as trace/state replacement. User files are untouched.
+fn stage_stale_states(
+    states_dir: &Path,
+    keep: &HashSet<String>,
+    transaction_id: uuid::Uuid,
+) -> Result<Vec<(PathBuf, PathBuf)>, CliError> {
+    let entries = match fs::read_dir(states_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            let _ = fs::remove_file(&tmp);
             return Err(CliError::Local(
-                anyhow::Error::new(err).context(format!("stage existing {}", path.display())),
+                anyhow::Error::new(err)
+                    .context(format!("read states dir {}", states_dir.display())),
             ));
         }
     };
 
-    if let Err(err) = fs::rename(&tmp, path) {
-        if had_old {
-            let _ = fs::rename(&backup, path);
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                let restore = restore_staged_stale_states(&staged);
+                return Err(CliError::Local(anyhow::anyhow!(match restore {
+                    Ok(()) => format!("read stale state entry: {err}"),
+                    Err(restore_err) => format!(
+                        "read stale state entry: {err}; restore also failed: {restore_err}"
+                    ),
+                })));
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !is_generated_state_name(name) || keep.contains(name) {
+            continue;
         }
-        let _ = fs::remove_file(&tmp);
-        return Err(CliError::Local(
-            anyhow::Error::new(err).context(format!("install {}", path.display())),
-        ));
+        let original = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                let restore = restore_staged_stale_states(&staged);
+                return Err(CliError::Local(anyhow::anyhow!(match restore {
+                    Ok(()) => format!("inspect stale state {}: {err}", original.display()),
+                    Err(restore_err) => format!(
+                        "inspect stale state {}: {err}; restore also failed: {restore_err}",
+                        original.display()
+                    ),
+                })));
+            }
+        };
+        if !file_type.is_file() {
+            let restore = restore_staged_stale_states(&staged);
+            return Err(CliError::Local(anyhow::anyhow!(match restore {
+                Ok(()) => format!("stale state {} is not a regular file", original.display()),
+                Err(restore_err) => format!(
+                    "stale state {} is not a regular file; restore also failed: {restore_err}",
+                    original.display()
+                ),
+            })));
+        }
+
+        let backup = states_dir.join(format!(".{name}.{transaction_id}.stale"));
+        if let Err(err) = fs::rename(&original, &backup) {
+            let restore = restore_staged_stale_states(&staged);
+            return Err(CliError::Local(anyhow::anyhow!(match restore {
+                Ok(()) => format!("stage stale state {}: {err}", original.display()),
+                Err(restore_err) => format!(
+                    "stage stale state {}: {err}; restore also failed: {restore_err}",
+                    original.display()
+                ),
+            })));
+        }
+        staged.push((original, backup));
     }
-    if had_old {
+    Ok(staged)
+}
+
+fn commit_export_transaction(
+    staging_dir: &Path,
+    states_dir: &Path,
+    keep_states: &HashSet<String>,
+    transaction_id: uuid::Uuid,
+    replacements: Vec<(PathBuf, PathBuf, PathBuf)>,
+) -> Result<(), CliError> {
+    let mut installed = Vec::with_capacity(replacements.len());
+    for (staged, target, backup) in replacements {
+        match commit_staged_file(&staged, &target, &backup) {
+            Ok(old_file) => installed.push((target, old_file)),
+            Err(err) => {
+                let rollback = rollback_installed_files(&installed);
+                let _ = fs::remove_dir_all(staging_dir);
+                return Err(CliError::Local(anyhow::anyhow!(match rollback {
+                    Ok(()) => format!("commit replacement {}: {err}", target.display()),
+                    Err(rollback_err) => format!(
+                        "commit replacement {}: {err}; rollback also failed: {rollback_err}",
+                        target.display()
+                    ),
+                })));
+            }
+        }
+    }
+
+    let stale_states = match stage_stale_states(states_dir, keep_states, transaction_id) {
+        Ok(stale) => stale,
+        Err(err) => {
+            let rollback = rollback_installed_files(&installed);
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(CliError::Local(anyhow::anyhow!(match rollback {
+                Ok(()) => err.to_string(),
+                Err(rollback_err) => {
+                    format!("{err}; replacement rollback also failed: {rollback_err}")
+                }
+            })));
+        }
+    };
+
+    for (_, backup) in &installed {
+        if let Some(backup) = backup {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    for (_, backup) in stale_states {
         let _ = fs::remove_file(backup);
     }
+    let _ = fs::remove_dir_all(staging_dir);
     Ok(())
 }
 
-fn write_v2(output_dir: &Path, trace: &RecordedTrace) -> Result<(), CliError> {
-    validate_record_output(output_dir)?;
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("create output dir {}", output_dir.display()))
-        .map_err(CliError::Local)?;
-    let path = trace_json_path(output_dir);
-    validate_replaceable_file(&path, "trace JSON")?;
-    let mut json = serde_json::to_vec_pretty(trace)
-        .context("serialize trace JSON")
-        .map_err(CliError::Local)?;
-    json.push(b'\n');
-    atomic_replace(&path, &json)
+struct ExternalizedState {
+    filename: String,
+    body: String,
 }
 
-fn write_state_bundle(
-    output_dir: &Path,
+fn externalize_state_bodies(
     trace: &RecordedTrace,
-    version: u32,
-) -> Result<PathBuf, CliError> {
-    validate_record_output(output_dir)?;
-    fs::create_dir_all(output_dir)
-        .with_context(|| format!("create output dir {}", output_dir.display()))
-        .map_err(CliError::Local)?;
-    let states_dir = states_dir_for_output(output_dir);
-    validate_directory(&states_dir, "states directory")?;
-    fs::create_dir_all(&states_dir)
-        .with_context(|| format!("create states dir {}", states_dir.display()))
-        .map_err(CliError::Local)?;
-
+    expected_version: u32,
+) -> Result<(serde_json::Value, Vec<ExternalizedState>), CliError> {
     let mut value = serde_json::to_value(trace)
         .context("serialize trace bundle")
         .map_err(CliError::Local)?;
@@ -200,9 +339,9 @@ fn write_state_bundle(
         .get("version")
         .and_then(|value| value.as_u64())
         .ok_or_else(|| CliError::Local(anyhow::anyhow!("state-linked trace has no version")))?;
-    if actual_version != u64::from(version) {
+    if actual_version != u64::from(expected_version) {
         return Err(CliError::Local(anyhow::anyhow!(
-            "trace version {actual_version} does not match expected {version}"
+            "trace version {actual_version} does not match expected {expected_version}"
         )));
     }
     let states = envelope
@@ -210,8 +349,9 @@ fn write_state_bundle(
         .and_then(|value| value.as_array_mut())
         .ok_or_else(|| CliError::Local(anyhow::anyhow!("state-linked trace has no states[]")))?;
 
-    let mut keep = HashSet::new();
-    for state in states.iter_mut() {
+    let mut seen = HashSet::with_capacity(states.len());
+    let mut externalized = Vec::with_capacity(states.len());
+    for state in states {
         let object = state.as_object_mut().ok_or_else(|| {
             CliError::Local(anyhow::anyhow!("trace state must be an object"))
         })?;
@@ -225,50 +365,132 @@ fn write_state_bundle(
                 "state id {id:?} is not canonical (expected s1, s2, ...)"
             )));
         }
-        let filename = format!("{id}.txt");
-        if !keep.insert(filename.clone()) {
+        if !seen.insert(id.clone()) {
             return Err(CliError::Local(anyhow::anyhow!("duplicate state id {id:?}")));
         }
         let body = object
             .remove("body")
             .and_then(|value| value.as_str().map(str::to_owned))
             .ok_or_else(|| CliError::Local(anyhow::anyhow!("trace state {id} has no body")))?;
-        let state_path = states_dir.join(&filename);
-        if state_path.parent() != Some(states_dir.as_path()) {
+        let filename = format!("{id}.txt");
+        object.insert("page".into(), serde_json::Value::String(filename.clone()));
+        externalized.push(ExternalizedState { filename, body });
+    }
+    Ok((value, externalized))
+}
+
+fn write_state_bundle(
+    output_dir: &Path,
+    trace: &RecordedTrace,
+    version: u32,
+) -> Result<PathBuf, CliError> {
+    let (disk_trace, state_writes) = externalize_state_bodies(trace, version)?;
+    let states_dir = states_dir_for_output(output_dir);
+    let trace_path = trace_json_path(output_dir);
+
+    let _lock = acquire_export_lock(output_dir)?;
+    validate_bundle_directory(&states_dir, "states directory")?;
+    fs::create_dir_all(&states_dir)
+        .with_context(|| format!("create states dir {}", states_dir.display()))
+        .map_err(CliError::Local)?;
+
+    let mut keep = HashSet::with_capacity(state_writes.len());
+    for state in &state_writes {
+        let target = states_dir.join(&state.filename);
+        if target.parent() != Some(states_dir.as_path()) {
             return Err(CliError::Local(anyhow::anyhow!(
                 "state path {} escapes states directory {}",
-                state_path.display(),
+                target.display(),
                 states_dir.display()
             )));
         }
-        validate_replaceable_file(&state_path, "state observation")?;
-        atomic_replace(&state_path, body.as_bytes())?;
-        object.insert("page".into(), serde_json::Value::String(filename));
+        validate_replaceable_file(&target, "state observation")?;
+        keep.insert(state.filename.clone());
     }
-
-    // Only remove files generated by an older BrowserSkill export. User files
-    // and non-canonical names are preserved.
-    if let Ok(entries) = fs::read_dir(&states_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let generated = name
-                .strip_suffix(".txt")
-                .is_some_and(is_canonical_state_id);
-            if generated && !keep.contains(name) {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
-
-    let trace_path = trace_json_path(output_dir);
     validate_replaceable_file(&trace_path, "trace JSON")?;
-    let mut json = serde_json::to_vec_pretty(&value)
-        .context("serialize bundle trace JSON")
+
+    let transaction_id = uuid::Uuid::new_v4();
+    let staging_dir = output_dir.join(format!(".bsk-record-stage-{transaction_id}"));
+    let staging_states = staging_dir.join("states");
+    fs::create_dir_all(&staging_states)
+        .with_context(|| format!("create staging dir {}", staging_states.display()))
         .map_err(CliError::Local)?;
-    json.push(b'\n');
-    atomic_replace(&trace_path, &json)?;
+
+    let stage_result: Result<(), CliError> = (|| {
+        for state in &state_writes {
+            let staged = staging_states.join(&state.filename);
+            fs::write(&staged, &state.body)
+                .with_context(|| format!("write staged state observation {}", staged.display()))
+                .map_err(CliError::Local)?;
+        }
+        let json = serde_json::to_string_pretty(&disk_trace)
+            .context("serialize bundle trace JSON")
+            .map_err(CliError::Local)?;
+        let staged_trace = staging_dir.join("trace.json");
+        fs::write(&staged_trace, format!("{json}\n"))
+            .with_context(|| format!("write staged trace to {}", staged_trace.display()))
+            .map_err(CliError::Local)?;
+        Ok(())
+    })();
+    if let Err(err) = stage_result {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(err);
+    }
+
+    let mut replacements = Vec::with_capacity(state_writes.len() + 1);
+    for state in &state_writes {
+        replacements.push((
+            staging_states.join(&state.filename),
+            states_dir.join(&state.filename),
+            states_dir.join(format!(".{}.{transaction_id}.bak", state.filename)),
+        ));
+    }
+    replacements.push((
+        staging_dir.join("trace.json"),
+        trace_path,
+        output_dir.join(format!(".trace.json.{transaction_id}.bak")),
+    ));
+
+    commit_export_transaction(
+        &staging_dir,
+        &states_dir,
+        &keep,
+        transaction_id,
+        replacements,
+    )?;
     Ok(states_dir)
+}
+
+fn write_trace_v2(output_dir: &Path, trace: &RecordedTrace) -> Result<(), CliError> {
+    let trace_path = trace_json_path(output_dir);
+    let states_dir = states_dir_for_output(output_dir);
+    let json = serde_json::to_string_pretty(trace)
+        .context("serialize trace JSON")
+        .map_err(CliError::Local)?;
+
+    let _lock = acquire_export_lock(output_dir)?;
+    validate_replaceable_file(&trace_path, "trace JSON")?;
+    let transaction_id = uuid::Uuid::new_v4();
+    let staging_dir = output_dir.join(format!(".bsk-record-stage-{transaction_id}"));
+    fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("create staging dir {}", staging_dir.display()))
+        .map_err(CliError::Local)?;
+    let staged_trace = staging_dir.join("trace.json");
+    fs::write(&staged_trace, format!("{json}\n"))
+        .with_context(|| format!("write staged trace to {}", staged_trace.display()))
+        .map_err(CliError::Local)?;
+
+    commit_export_transaction(
+        &staging_dir,
+        &states_dir,
+        &HashSet::new(),
+        transaction_id,
+        vec![(
+            staged_trace,
+            trace_path,
+            output_dir.join(format!(".trace.json.{transaction_id}.bak")),
+        )],
+    )
 }
 
 pub(super) fn export_recorded_trace(
@@ -293,7 +515,7 @@ pub(super) fn export_recorded_trace(
             })
         }
         RecordedTrace::V2(_) => {
-            write_v2(output_dir, trace)?;
+            write_trace_v2(output_dir, trace)?;
             Ok(ExportMeta {
                 states_dir: None,
                 trace_version: TRACE_VERSION_V2,
@@ -345,7 +567,7 @@ mod tests {
         TraceStateV4, TraceV4, CAUSAL_FORMAT_VERSION,
     };
 
-    fn sample_v4() -> RecordedTrace {
+    fn sample_v4(state_id: &str, body: &str) -> RecordedTrace {
         RecordedTrace::V4(TraceV4 {
             version: TRACE_VERSION_V4,
             purpose: Some("test causal export".into()),
@@ -356,7 +578,7 @@ mod tests {
                 start_url: "https://example.com".into(),
             },
             recorder: RecorderInfoV4 {
-                bsk: "0.1.0".into(),
+                bsk: "0.2.0".into(),
                 vom: 1,
                 causal: CAUSAL_FORMAT_VERSION,
             },
@@ -367,10 +589,10 @@ mod tests {
                 redact_values: Some(true),
             },
             states: vec![TraceStateV4 {
-                id: "s1".into(),
+                id: state_id.into(),
                 url: "https://example.com".into(),
                 title: Some("Example".into()),
-                body: "@vom 1\nRootWebArea \"Example\"".into(),
+                body: body.into(),
                 truncated: false,
                 capture: None,
             }],
@@ -379,25 +601,74 @@ mod tests {
     }
 
     #[test]
-    fn v4_bundle_keeps_causal_envelope_and_externalizes_state_body() {
+    fn v4_bundle_externalizes_body_without_dropping_causal_fields() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("trace");
-        let trace = sample_v4();
+        let trace = sample_v4("s1", "@vom 1\nRootWebArea \"Example\"");
         let meta = export_recorded_trace(&output, &trace).unwrap();
         assert_eq!(meta.trace_version, TRACE_VERSION_V4);
-        let json: serde_json::Value =
+        let disk: serde_json::Value =
             serde_json::from_slice(&fs::read(trace_json_path(&output)).unwrap()).unwrap();
-        assert_eq!(json["version"], TRACE_VERSION_V4);
-        assert_eq!(json["recorder"]["causal"], CAUSAL_FORMAT_VERSION);
-        assert_eq!(json["states"][0]["page"], "s1.txt");
-        assert!(json["states"][0].get("body").is_none());
-        assert!(states_dir_for_output(&output).join("s1.txt").is_file());
+        assert_eq!(disk["version"], TRACE_VERSION_V4);
+        assert_eq!(disk["recorder"]["causal"], CAUSAL_FORMAT_VERSION);
+        assert_eq!(disk["states"][0]["page"], "s1.txt");
+        assert!(disk["states"][0].get("body").is_none());
+        assert_eq!(
+            fs::read_to_string(states_dir_for_output(&output).join("s1.txt")).unwrap(),
+            "@vom 1\nRootWebArea \"Example\""
+        );
     }
 
     #[test]
-    fn json_file_output_is_rejected() {
+    fn target_validation_failure_preserves_previous_bundle() {
         let dir = tempfile::tempdir().unwrap();
-        let output = dir.path().join("trace.json");
-        assert!(validate_record_output(&output).is_err());
+        let output = dir.path().join("trace");
+        export_recorded_trace(&output, &sample_v4("s1", "original")).unwrap();
+        let original_trace = fs::read(trace_json_path(&output)).unwrap();
+        fs::create_dir(states_dir_for_output(&output).join("s2.txt")).unwrap();
+
+        let err = export_recorded_trace(&output, &sample_v4("s2", "replacement")).unwrap_err();
+        assert!(err.to_string().contains("state observation"));
+        assert_eq!(fs::read(trace_json_path(&output)).unwrap(), original_trace);
+        assert_eq!(
+            fs::read_to_string(states_dir_for_output(&output).join("s1.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_failure_rolls_back_all_replacements() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("trace");
+        export_recorded_trace(&output, &sample_v4("s1", "original")).unwrap();
+        let original_trace = fs::read(trace_json_path(&output)).unwrap();
+        fs::create_dir(states_dir_for_output(&output).join("s9.txt")).unwrap();
+
+        let err = export_recorded_trace(&output, &sample_v4("s2", "replacement")).unwrap_err();
+        assert!(err.to_string().contains("stale state"));
+        assert_eq!(fs::read(trace_json_path(&output)).unwrap(), original_trace);
+        assert_eq!(
+            fs::read_to_string(states_dir_for_output(&output).join("s1.txt")).unwrap(),
+            "original"
+        );
+        assert!(!states_dir_for_output(&output).join("s2.txt").exists());
+        assert!(states_dir_for_output(&output).join("s9.txt").is_dir());
+    }
+
+    #[test]
+    fn traversal_and_duplicate_state_ids_are_rejected_before_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("trace");
+        let traversal = sample_v4("../outside", "bad");
+        assert!(export_recorded_trace(&output, &traversal).is_err());
+        assert!(!trace_json_path(&output).exists());
+
+        let mut duplicate = match sample_v4("s1", "one") {
+            RecordedTrace::V4(trace) => trace,
+            _ => unreachable!(),
+        };
+        duplicate.states.push(duplicate.states[0].clone());
+        assert!(export_recorded_trace(&output, &RecordedTrace::V4(duplicate)).is_err());
+        assert!(!trace_json_path(&output).exists());
     }
 }
