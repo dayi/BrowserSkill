@@ -134,10 +134,9 @@ export function observeRecordedNavigation(
     causal: {
       actionEpochMs: now,
       receivedEpochMs: now,
-      effects:
-        previousUrl && previousUrl !== url
-          ? { navigation: [{ from: previousUrl, to: url }] }
-          : undefined,
+      ...(previousUrl && previousUrl !== url
+        ? { effects: { navigation: [{ from: previousUrl, to: url }] } }
+        : {}),
     },
   });
   return { kind: "appended", index: buffer.steps.length - 1 };
