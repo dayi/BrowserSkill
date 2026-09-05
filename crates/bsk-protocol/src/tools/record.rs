@@ -1,8 +1,7 @@
 //! Semantic user-action recording (`tool.record_start` / `stop` / `await`).
 //!
-//! Wire traces are Trace v2 (`pages[]`), Trace v3 (`version: 3`,
-//! `states[]`), or Trace v4 (`version: 4`, `states[]` + causal effects).
-//! Version-specific models live in `record_v2` / `record_v3` / `record_v4`.
+//! Wire traces are Trace v2 (`pages[]`), Trace v3 (`version: 3`, `states[]`),
+//! or Trace v4 (`version: 4`, `states[]` + causal effects).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,10 +27,6 @@ pub use super::record_v4::{
 
 /// Logical v2 identifier. Not a wire field — v2 envelopes omit `version`.
 pub const TRACE_VERSION_V2: u32 = 2;
-
-// ---------------------------------------------------------------------------
-// RPC params / results
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RecordStartParams {
@@ -139,13 +134,46 @@ impl JsonSchema for RecordedTrace {
     }
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::SchemaObject {
+        // Preserve the legacy classifier contract: a numeric version selects a
+        // state-linked trace; no version selects v2. The versioned arm is then
+        // narrowed to strict TraceV3 or TraceV4 schemas.
+        let mut version_props = schemars::Map::new();
+        version_props.insert(
+            "version".into(),
+            schemars::schema::SchemaObject {
+                instance_type: Some(schemars::schema::InstanceType::Integer.into()),
+                ..Default::default()
+            }
+            .into(),
+        );
+        let mut required = schemars::Set::new();
+        required.insert("version".into());
+        let versioned = schemars::schema::SchemaObject {
             subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
                 one_of: Some(vec![
-                    generator.subschema_for::<TraceV2>(),
                     generator.subschema_for::<TraceV3>(),
                     generator.subschema_for::<TraceV4>(),
                 ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        schemars::schema::SchemaObject {
+            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                if_schema: Some(Box::new(
+                    schemars::schema::SchemaObject {
+                        object: Some(Box::new(schemars::schema::ObjectValidation {
+                            properties: version_props,
+                            required,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                )),
+                then_schema: Some(Box::new(versioned.into())),
+                else_schema: Some(Box::new(generator.subschema_for::<TraceV2>())),
                 ..Default::default()
             })),
             ..Default::default()
@@ -215,13 +243,46 @@ impl JsonSchema for RecordedStep {
     }
 
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::SchemaObject {
+        let mut required = schemars::Set::new();
+        required.insert("state".into());
+        let mut mixed_keys = schemars::Set::new();
+        mixed_keys.insert("page".into());
+        mixed_keys.insert("state".into());
+        let versioned = schemars::schema::SchemaObject {
             subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
                 one_of: Some(vec![
-                    generator.subschema_for::<StepV2>(),
                     generator.subschema_for::<StepV3>(),
                     generator.subschema_for::<StepV4>(),
                 ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        schemars::schema::SchemaObject {
+            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                if_schema: Some(Box::new(
+                    schemars::schema::SchemaObject {
+                        object: Some(Box::new(schemars::schema::ObjectValidation {
+                            required,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                )),
+                then_schema: Some(Box::new(versioned.into())),
+                else_schema: Some(Box::new(generator.subschema_for::<StepV2>())),
+                not: Some(Box::new(
+                    schemars::schema::SchemaObject {
+                        object: Some(Box::new(schemars::schema::ObjectValidation {
+                            required: mixed_keys,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .into(),
+                )),
                 ..Default::default()
             })),
             ..Default::default()
@@ -239,7 +300,7 @@ pub struct RecordStopResult {
 pub struct RecordAwaitParams {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -250,33 +311,202 @@ pub struct RecordAwaitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn sample_common(id: u32, state: &str, result_state: &str) -> StepCommonV3 {
+        StepCommonV3 {
+            id,
+            state: state.into(),
+            result: StepResultV3 { state: result_state.into() },
+        }
+    }
+
+    fn sample_target() -> TargetDescriptorV3 {
+        TargetDescriptorV3 {
+            element_ref: Some("e21".into()),
+            role: Some("button".into()),
+            name: Some("发布".into()),
+            ctx: Some("金桔柠檬 6 号".into()),
+            unmatched: false,
+        }
+    }
 
     #[test]
-    fn recorded_trace_classifies_v4() {
-        let value = serde_json::json!({
+    fn v3_step_round_trips_unchanged() {
+        let step = StepV3::Click {
+            common: sample_common(1, "s1", "s2"),
+            target: sample_target(),
+        };
+        let v = serde_json::to_value(&step).unwrap();
+        assert_eq!(v["op"], "click");
+        assert_eq!(v["state"], "s1");
+        assert_eq!(v["result"]["state"], "s2");
+        assert_eq!(v["target"]["ref"], "e21");
+        assert_eq!(serde_json::from_value::<StepV3>(v).unwrap(), step);
+    }
+
+    #[test]
+    fn v3_fill_redaction_contract_is_preserved() {
+        let step = StepV3::Fill {
+            common: sample_common(1, "s1", "s1"),
+            target: TargetDescriptorV3 {
+                element_ref: Some("e3".into()),
+                role: Some("textbox".into()),
+                name: Some("密码".into()),
+                ctx: None,
+                unmatched: false,
+            },
+            value: "***".into(),
+            commit: FillCommit::Blur,
+            redacted: true,
+        };
+        let v = serde_json::to_value(step).unwrap();
+        assert_eq!(v["value"], "***");
+        assert_eq!(v["redacted"], true);
+    }
+
+    #[test]
+    fn record_start_v4_options_are_optional_without_changing_legacy_wire() {
+        let legacy = RecordStartParams {
+            session_id: "session".into(),
+            tab_id: None,
+            url: None,
+            purpose: None,
+            max_page_tokens: None,
+            redact_values: None,
+            trace_version: None,
+            supports_tab_switch_steps: None,
+            diagnostics: None,
+            settle_max_ms: None,
+            capture_effects: None,
+        };
+        let value = serde_json::to_value(legacy).unwrap();
+        assert!(value.get("trace_version").is_none());
+        assert!(value.get("diagnostics").is_none());
+        assert!(value.get("settle_max_ms").is_none());
+        assert!(value.get("capture_effects").is_none());
+    }
+
+    #[test]
+    fn recorded_trace_classifies_v2_v3_and_v4() {
+        let v2 = json!({
+            "recorded_at": "2026-07-21T08:00:00Z",
+            "entry": { "start_url": "https://example.com/" },
+            "pages": [{ "id": "p1", "url": "https://example.com/" }],
+            "steps": []
+        });
+        assert!(matches!(RecordedTrace::classify_value(&v2), Ok(RecordedTrace::V2(_))));
+
+        let v3 = json!({
+            "version": 3,
+            "recorded_at": "2026-07-21T08:00:00Z",
+            "stopped_by": "user_finish",
+            "entry": { "start_url": "https://example.com/" },
+            "recorder": { "bsk": "0.1.10", "vom": 1 },
+            "states": [],
+            "steps": []
+        });
+        assert!(matches!(RecordedTrace::classify_value(&v3), Ok(RecordedTrace::V3(_))));
+
+        let v4 = json!({
             "version": 4,
             "recorded_at": "2026-09-05T00:00:01Z",
             "stopped_by": "cli_stop",
             "entry": { "start_url": "https://example.com" },
-            "recorder": { "bsk": "0.1.0", "vom": 1, "causal": 1 },
+            "recorder": { "bsk": "0.2.0", "vom": 1, "causal": 1 },
             "capture": { "diagnostics": "standard", "effects": [] },
             "states": [],
             "steps": []
         });
-        assert!(matches!(RecordedTrace::classify_value(&value), Ok(RecordedTrace::V4(_))));
+        assert!(matches!(RecordedTrace::classify_value(&v4), Ok(RecordedTrace::V4(_))));
     }
 
     #[test]
-    fn recorded_trace_keeps_v3_classification() {
-        let value = serde_json::json!({
-            "version": 3,
+    fn recorded_trace_rejects_mixed_and_unsupported_versions() {
+        let mixed = json!({
+            "version": 4,
             "recorded_at": "2026-09-05T00:00:01Z",
             "stopped_by": "cli_stop",
             "entry": { "start_url": "https://example.com" },
-            "recorder": { "bsk": "0.1.0", "vom": 1 },
-            "states": [],
-            "steps": []
+            "recorder": { "bsk": "0.2.0", "vom": 1, "causal": 1 },
+            "capture": { "diagnostics": "standard", "effects": [] },
+            "pages": [], "states": [], "steps": []
         });
-        assert!(matches!(RecordedTrace::classify_value(&value), Ok(RecordedTrace::V3(_))));
+        assert!(RecordedTrace::classify_value(&mixed).is_err());
+        assert!(RecordedTrace::classify_value(&json!({"version": 5, "states": [], "steps": []})).is_err());
+    }
+
+    fn v2_click() -> serde_json::Value {
+        json!({
+            "op": "click", "id": 1, "page": "p1",
+            "target": { "tag": "button", "role": "button", "name": "发布" }
+        })
+    }
+
+    fn v3_click() -> serde_json::Value {
+        json!({
+            "op": "click", "id": 1, "state": "s1",
+            "result": { "state": "s2" },
+            "target": { "ref": "e1", "role": "button", "name": "发布" }
+        })
+    }
+
+    fn v4_click() -> serde_json::Value {
+        json!({
+            "op": "click", "id": 1, "state": "s1",
+            "timing": { "action_at_ms": 10.0 },
+            "settle": { "reason": "quiet", "duration_ms": 20.0 },
+            "effects": {},
+            "result": { "state": "s2", "observation": "changed" },
+            "target": { "ref": "e1", "role": "button", "name": "发布" }
+        })
+    }
+
+    #[test]
+    fn recorded_step_classifies_all_versions_and_rejects_mixed_page_state() {
+        assert!(matches!(RecordedStep::classify_value(&v2_click()), Ok(RecordedStep::V2(_))));
+        assert!(matches!(RecordedStep::classify_value(&v3_click()), Ok(RecordedStep::V3(_))));
+        assert!(matches!(RecordedStep::classify_value(&v4_click()), Ok(RecordedStep::V4(_))));
+
+        let mut mixed = v2_click();
+        mixed["state"] = json!("s1");
+        mixed["result"] = json!({ "state": "s2" });
+        assert!(RecordedStep::classify_value(&mixed).is_err());
+    }
+
+    #[test]
+    fn recorded_trace_schema_contains_all_versions() {
+        let schema = serde_json::to_value(schemars::schema_for!(RecordedTrace)).unwrap();
+        assert_eq!(schema["if"]["required"], json!(["version"]));
+        assert_eq!(schema["else"]["$ref"], "#/definitions/TraceV2");
+        let refs = schema["then"]["oneOf"].as_array().unwrap();
+        assert!(refs.iter().any(|v| v["$ref"] == "#/definitions/TraceV3"));
+        assert!(refs.iter().any(|v| v["$ref"] == "#/definitions/TraceV4"));
+    }
+
+    #[test]
+    fn legacy_extension_v3_trace_still_deserializes() {
+        let value = json!({
+            "version": 3,
+            "recorded_at": "2026-07-21T08:00:00Z",
+            "started_at": "2026-07-21T07:59:00Z",
+            "purpose": "demo",
+            "stopped_by": "user_finish",
+            "entry": { "start_url": "https://example.com/editor" },
+            "recorder": { "bsk": "0.1.10", "vom": 1 },
+            "states": [
+                { "id": "s1", "url": "https://example.com/editor", "body": "@vom 1" },
+                { "id": "s2", "url": "https://example.com/p/99", "body": "@vom 1" }
+            ],
+            "steps": [
+                {
+                    "op": "click", "id": 1, "state": "s1",
+                    "result": { "state": "s2" },
+                    "target": { "ref": "e2", "role": "button", "name": "发布" }
+                }
+            ]
+        });
+        let trace: RecordedTrace = serde_json::from_value(value).unwrap();
+        assert!(matches!(trace, RecordedTrace::V3(_)));
     }
 }
