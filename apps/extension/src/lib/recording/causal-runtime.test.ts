@@ -177,6 +177,90 @@ describe("RecordingCausalRuntime", () => {
 
     runtime.dispose();
   });
+
+  it("records explicit main-frame from-to navigation instead of a dead navigation_seen marker", async () => {
+    vi.useFakeTimers();
+    const fake = fakeCdp();
+    const runtime = new RecordingCausalRuntime(fake.cdp);
+    const source: CdpDebuggee = { tabId: 20 };
+    await runtime.ensureTab(20);
+
+    setNow(3_990);
+    fake.emit(source, "Page.frameNavigated", {
+      frame: { id: "main", url: "https://oa.example.test/list" },
+    });
+    setNow(4_000);
+    const actionEpochMs = Date.now();
+    setNow(4_015);
+    fake.emit(source, "Page.frameNavigated", {
+      frame: { id: "main", url: "https://oa.example.test/detail/42" },
+    });
+
+    const effects = runtime.effectsForWindow({
+      tabId: 20,
+      actionEpochMs,
+      settledEpochMs: 4_050,
+    });
+    expect(effects.navigation).toEqual([
+      {
+        from: "https://oa.example.test/list",
+        to: "https://oa.example.test/detail/42",
+      },
+    ]);
+    runtime.dispose();
+  });
+
+  it("keeps each HTTP redirect leg when CDP reuses requestId", async () => {
+    vi.useFakeTimers();
+    const fake = fakeCdp();
+    const runtime = new RecordingCausalRuntime(fake.cdp);
+    const source: CdpDebuggee = { tabId: 21 };
+    await runtime.ensureTab(21);
+
+    setNow(5_000);
+    const actionEpochMs = Date.now();
+    setNow(5_005);
+    fake.emit(source, "Network.requestWillBeSent", {
+      requestId: "redirected",
+      timestamp: 20,
+      type: "Document",
+      request: { method: "GET", url: "https://example.test/start" },
+    });
+    setNow(5_010);
+    fake.emit(source, "Network.requestWillBeSent", {
+      requestId: "redirected",
+      timestamp: 20.01,
+      type: "Document",
+      redirectResponse: { status: 302 },
+      request: { method: "GET", url: "https://example.test/final" },
+    });
+    setNow(5_015);
+    fake.emit(source, "Network.responseReceived", {
+      requestId: "redirected",
+      response: { status: 200 },
+    });
+    setNow(5_025);
+    fake.emit(source, "Network.loadingFinished", {
+      requestId: "redirected",
+      timestamp: 20.025,
+    });
+
+    const effects = runtime.effectsForWindow({
+      tabId: 21,
+      actionEpochMs,
+      settledEpochMs: 5_050,
+    });
+    expect(effects.network).toHaveLength(2);
+    expect(effects.network?.[0]).toMatchObject({
+      url: "https://example.test/start",
+      status: 302,
+    });
+    expect(effects.network?.[1]).toMatchObject({
+      url: "https://example.test/final",
+      status: 200,
+    });
+    runtime.dispose();
+  });
 });
 
 describe("sanitizeRecordedUrl", () => {
