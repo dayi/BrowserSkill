@@ -84,6 +84,7 @@ interface ActivityContext {
 export class DocumentActivityManager {
   readonly #cdp: CdpRunner;
   readonly #contexts = new Map<string, ActivityContext>();
+  readonly #lastSnapshots = new Map<string, DocumentActivitySnapshot>();
 
   constructor(cdp: CdpRunner) {
     this.#cdp = cdp;
@@ -91,6 +92,10 @@ export class DocumentActivityManager {
 
   async ensure(scope: DocumentSettleScope): Promise<DocumentActivitySnapshot | null> {
     return this.read(scope);
+  }
+
+  last(scope: DocumentSettleScope): DocumentActivitySnapshot | null {
+    return this.#lastSnapshots.get(this.#scopeKey(scope)) ?? null;
   }
 
   async read(scope: DocumentSettleScope): Promise<DocumentActivitySnapshot | null> {
@@ -124,17 +129,21 @@ export class DocumentActivityManager {
             : {}),
         },
       );
-      return parseSnapshot(reply.result?.value);
+      const snapshot = parseSnapshot(reply.result?.value);
+      if (snapshot) this.#lastSnapshots.set(key, snapshot);
+      return snapshot;
     } catch {
-      // Navigation invalidates execution contexts; retry with a fresh world on
-      // the next read instead of surfacing a recording failure.
+      // Navigation invalidates execution contexts and the old snapshot no
+      // longer describes the replacement Document.
       this.#contexts.delete(key);
+      this.#lastSnapshots.delete(key);
       return null;
     }
   }
 
   clear(): void {
     this.#contexts.clear();
+    this.#lastSnapshots.clear();
   }
 
   #scopeKey(scope: DocumentSettleScope): string {
