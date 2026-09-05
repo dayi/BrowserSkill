@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bsk_protocol::tools::{
-    RecordAwaitParams, RecordAwaitResult, RecordStartParams, RecordStartResult, RecordStopParams,
-    RecordStopResult, RecordedTrace, TRACE_VERSION_V3,
+    RecordAwaitParams, RecordAwaitResult, RecordDiagnosticsLevel, RecordStartParams,
+    RecordStartResult, RecordStopParams, RecordStopResult, RecordedTrace, TRACE_VERSION_V4,
 };
 use bsk_protocol::{ErrorCode, Method};
 use clap::{Args, Subcommand};
@@ -114,8 +114,11 @@ fn dispatch_start(args: RecordStartArgs, format: Format) -> Result<(), CliError>
         purpose: args.purpose.clone(),
         max_page_tokens: args.max_page_tokens,
         redact_values: Some(args.redact_values),
-        trace_version: Some(TRACE_VERSION_V3),
+        trace_version: Some(TRACE_VERSION_V4),
         supports_tab_switch_steps: Some(true),
+        diagnostics: Some(RecordDiagnosticsLevel::Standard),
+        settle_max_ms: None,
+        capture_effects: None,
     };
     let start_result = business_rpc::call::<RecordStartParams, RecordStartResult>(
         info.sock_path.clone(),
@@ -288,6 +291,14 @@ fn render_finish(
     match format {
         Format::Json => {
             let payload = match trace {
+                RecordedTrace::V4(t) => serde_json::json!({
+                    "output": output_dir,
+                    "trace_json": trace_path,
+                    "trace_version": exported.trace_version,
+                    "states_dir": exported.states_dir,
+                    "trace": t,
+                    "window_closed": true,
+                }),
                 RecordedTrace::V3(t) => serde_json::json!({
                     "output": output_dir,
                     "trace_json": trace_path,
@@ -311,6 +322,20 @@ fn render_finish(
             );
         }
         Format::Human => match trace {
+            RecordedTrace::V4(t) => {
+                let states_dir = exported
+                    .states_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| states_dir_for_output(output_dir).display().to_string());
+                println!(
+                    "saved {} causal steps to {} and {} states to {} (trace v4)",
+                    t.steps.len(),
+                    trace_path.display(),
+                    t.states.len(),
+                    states_dir
+                );
+            }
             RecordedTrace::V3(t) => {
                 let states_dir = exported
                     .states_dir
@@ -328,7 +353,7 @@ fn render_finish(
             RecordedTrace::V2(t) => {
                 if exported.v2_fallback {
                     eprintln!(
-                        "note: extension returned trace v2 (no page observations); update the BrowserSkill extension for v3 bundles"
+                        "note: extension returned trace v2 (no page observations); update the BrowserSkill extension for state-linked bundles"
                     );
                 }
                 println!(
