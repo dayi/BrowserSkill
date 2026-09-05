@@ -48,6 +48,53 @@ With a trace, follow its semantic target information and values in order, but tr
 record-local hints. Stop when its purpose or last meaningful effect is satisfied. A trace guides the
 task; it does not expand the user's goal or authorize additional actions.
 
+### Replay Trace v4 as an effect contract
+
+Trace v4 adds durable target fingerprints and causal effects. Use them as evidence, not as permission
+to repeat actions blindly.
+
+Before every trace-driven interaction:
+
+1. Run a fresh `bsk observe` after navigation or a meaningful page change. Never reuse the trace's
+   old `target.ref` as the current ref.
+2. Match the recorded target by **stable semantics first**: role/name, then fingerprint attributes
+   such as `data-testid`, `data-test`, `data-cy`, stable id/name, aria label/controls/haspopup,
+   placeholder, nearby business text, and semantic context. Geometry and old `@eN` numbering are
+   weak hints only.
+3. When exactly one fresh observation candidate has the recorded role/name/context, use its current
+   ref. When candidates are ambiguous, do not guess. Use one `snapshot` or `get-html` read to inspect
+   the smallest relevant region/markup for the recorded stable attribute, or ask for help if the
+   ambiguity remains.
+4. If a candidate contradicts a strong recorded identity (`data-testid`, `data-test`, `data-cy`, or
+   a stable id), reject it even when its visible label looks similar.
+
+After a trace-driven action, compare the result with the **recorded effects**, prioritizing high
+signal evidence:
+
+- recorded navigation destination or same-document route change;
+- recorded Document/XHR/Fetch endpoint and success/failure class;
+- high-signal DOM changes such as an appeared success/status/dialog or a disappeared actionable
+  control;
+- recorded console exception/error or browser security block.
+
+Use `observe` for semantic DOM effects, `network` for request evidence, and `console` for errors only
+when the trace says those effects matter or the visible result is ambiguous. Do not perform every
+possible diagnostic read after every action.
+
+Treat effect verification asymmetrically:
+
+- **Matched:** the goal/effect is already present; continue to the next needed step or stop.
+- **Partial/unknown:** inspect current state before deciding anything. For a mutating action, do **not**
+  automatically click/fill/submit again because the first attempt may already have committed.
+- **Mismatch:** if a new CSP/CORS/certificate/policy block, unexpected console error, wrong
+  navigation, or contradictory business state appears, stop the replay path and report/request help.
+- A missing low-signal mutation count alone is not proof of failure; business-visible effects outrank
+  raw mutation volume and exact timing.
+
+Recorded timing and settle duration are expectations, not fixed sleeps. Wait for the actual effect
+when possible. If the current page takes longer than the recording but is still making relevant
+progress, use one purposeful wait/observation rather than replaying the action.
+
 ## Observe, act, observe
 
 Use this default loop:
@@ -169,9 +216,12 @@ intended. Read `bsk upload --help` and `bsk download --help` for all flags and e
 
 ## Recover without wandering
 
-- Stale ref: observe again and retry the intended action once.
+- Stale ref: observe again and retry the intended action once, but for a mutating trace-driven step
+  first verify that its recorded effect is absent; stale transport/ref failure is safer to retry than
+  an unknown action outcome.
 - Unknown tab or session: list current tabs/sessions; never guess identifiers.
-- Timeout: inspect current page state before deciding whether one longer purposeful wait is useful.
+- Timeout: inspect current page state and the trace's expected effects before deciding whether one
+  longer purposeful wait is useful. Do not repeat a submit/click merely because the timeout expired.
 - Unsupported command: continue with available capabilities; suggest updating only when the missing
   command is necessary.
 - Unrecoverable failure: report the blocker and stop the session in a finally-style path.
