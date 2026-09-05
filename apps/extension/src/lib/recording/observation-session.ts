@@ -2,6 +2,7 @@ import type { CdpRunner, ChromeTabsApi } from "@/tools/shared";
 import { captureRecordingObservation, type RegisteredObservation } from "./observation-capture";
 import { RecordingStateRegistry } from "./state-registry";
 import { matchObservationTarget, unmatchedTarget } from "./target-matcher";
+import { enrichTargetFingerprint, fingerprintFromCaptureTarget } from "./target-fingerprint";
 import type { RecordingDraftStep, StepAnnotation, TargetedRecordingDraft } from "./types";
 
 const DEFAULT_MAX_PAGE_TOKENS = 3_000;
@@ -106,6 +107,20 @@ export class RecordingObservationSession {
             fallback: draft.captureTarget,
           })
         : unmatchedTarget(draft.captureTarget);
+
+      const baseFingerprint = draft.fingerprint ?? fingerprintFromCaptureTarget(draft.captureTarget);
+      if (observation && draft.matchedTarget.ref) {
+        const node = observation.index.nodeForRef(draft.matchedTarget.ref);
+        draft.fingerprint = enrichTargetFingerprint(baseFingerprint, {
+          ...(node?.geometry.tag ? { tag: node.geometry.tag } : {}),
+          ...(draft.matchedTarget.role ? { role: draft.matchedTarget.role } : {}),
+          ...(draft.matchedTarget.name ? { name: draft.matchedTarget.name } : {}),
+          ...(draft.matchedTarget.ctx ? { context: draft.matchedTarget.ctx } : {}),
+          ...(node?.geometry.fingerprintAttrs ? { attrs: node.geometry.fingerprintAttrs } : {}),
+        });
+      } else if (baseFingerprint) {
+        draft.fingerprint = baseFingerprint;
+      }
     }
     if (!observation) return;
 
