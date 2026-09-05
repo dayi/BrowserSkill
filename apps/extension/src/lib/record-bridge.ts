@@ -3,7 +3,7 @@
  * service worker and a tab's content script.
  */
 
-import type { CaptureTargetDescriptor } from "./describe-target";
+import type { CaptureElementFingerprint, CaptureTargetDescriptor } from "./describe-target";
 
 export const RECORD_START = "bsk-record-start";
 export const RECORD_STEP = "bsk-record-step";
@@ -44,9 +44,18 @@ export interface RecordStartMessage {
   startedAtMs?: number;
 }
 
+export interface RecordStepTiming {
+  /** Epoch milliseconds for the original DOM event, before SW message latency. */
+  event_epoch_ms: number;
+  /** Milliseconds since record start when available. */
+  event_offset_ms?: number;
+}
+
 export interface RecordStepPayload {
   op: "click" | "hover" | "fill" | "press" | "select" | "navigate";
   target?: CaptureTargetDescriptor;
+  /** Durable replay identity captured from the actual interacted element. */
+  fingerprint?: CaptureElementFingerprint;
   value?: string;
   key?: string;
   modifiers?: Array<"alt" | "ctrl" | "meta" | "shift">;
@@ -57,6 +66,8 @@ export interface RecordStepPayload {
   commit?: "enter" | "suggestion" | "blur";
   /** Page URL when the step was captured. */
   page_url?: string;
+  /** Event timing captured in the content-script capture phase. */
+  timing?: RecordStepTiming;
   /** Event-target bounds in the source frame's viewport coordinate space. */
   geometry?: {
     rect: { x: number; y: number; w: number; h: number };
