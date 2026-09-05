@@ -90,38 +90,48 @@ function nonEmpty(value: string | undefined): string | undefined {
   return trimmed || undefined;
 }
 
-function projectFingerprintAttrs(attrs: Record<string, string>): CaptureVomFingerprintAttrs | undefined {
+/** Exported for a narrow unit test; callers should consume matchNodes instead. */
+export function projectFingerprintAttrs(
+  attrs: Record<string, string>,
+): CaptureVomFingerprintAttrs | undefined {
+  const id = nonEmpty(attrs.id);
+  const name = nonEmpty(attrs.name);
+  const inputType = nonEmpty(attrs.type)?.toLowerCase();
+  const testId = nonEmpty(attrs["data-testid"]);
+  const dataTest = nonEmpty(attrs["data-test"]);
+  const dataCy = nonEmpty(attrs["data-cy"]);
+  const ariaLabel = nonEmpty(attrs["aria-label"]);
+  const ariaControls = nonEmpty(attrs["aria-controls"]);
+  const ariaHaspopup = nonEmpty(attrs["aria-haspopup"]);
+  const placeholder = nonEmpty(attrs.placeholder);
   const projected: CaptureVomFingerprintAttrs = {
-    ...(nonEmpty(attrs.id) ? { id: nonEmpty(attrs.id) } : {}),
-    ...(nonEmpty(attrs.name) ? { name: nonEmpty(attrs.name) } : {}),
-    ...(nonEmpty(attrs.type) ? { input_type: nonEmpty(attrs.type)?.toLowerCase() } : {}),
-    ...(nonEmpty(attrs["data-testid"]) ? { test_id: nonEmpty(attrs["data-testid"]) } : {}),
-    ...(nonEmpty(attrs["data-test"]) ? { data_test: nonEmpty(attrs["data-test"]) } : {}),
-    ...(nonEmpty(attrs["data-cy"]) ? { data_cy: nonEmpty(attrs["data-cy"]) } : {}),
-    ...(nonEmpty(attrs["aria-label"]) ? { aria_label: nonEmpty(attrs["aria-label"]) } : {}),
-    ...(nonEmpty(attrs["aria-controls"])
-      ? { aria_controls: nonEmpty(attrs["aria-controls"]) }
-      : {}),
-    ...(nonEmpty(attrs["aria-haspopup"])
-      ? { aria_haspopup: nonEmpty(attrs["aria-haspopup"]) }
-      : {}),
-    ...(nonEmpty(attrs.placeholder) ? { placeholder: nonEmpty(attrs.placeholder) } : {}),
+    ...(id ? { id } : {}),
+    ...(name ? { name } : {}),
+    ...(inputType ? { input_type: inputType } : {}),
+    ...(testId ? { test_id: testId } : {}),
+    ...(dataTest ? { data_test: dataTest } : {}),
+    ...(dataCy ? { data_cy: dataCy } : {}),
+    ...(ariaLabel ? { aria_label: ariaLabel } : {}),
+    ...(ariaControls ? { aria_controls: ariaControls } : {}),
+    ...(ariaHaspopup ? { aria_haspopup: ariaHaspopup } : {}),
+    ...(placeholder ? { placeholder } : {}),
   };
   return Object.keys(projected).length ? projected : undefined;
 }
 
 function projectMatchNodes(documents: CapturedFrameDocument<FrameAxNode>[]): CaptureVomMatchNode[] {
   return documents.flatMap((document) =>
-    document.domNodes.map((node) => ({
-      frameId: document.frameId,
-      backendNodeId: node.backendNodeId,
-      tag: node.tag,
-      rect: node.rect,
-      ...(node.localRect !== undefined ? { localRect: node.localRect } : {}),
-      ...(projectFingerprintAttrs(node.attrs)
-        ? { fingerprintAttrs: projectFingerprintAttrs(node.attrs) }
-        : {}),
-    })),
+    document.domNodes.map((node) => {
+      const fingerprintAttrs = projectFingerprintAttrs(node.attrs);
+      return {
+        frameId: document.frameId,
+        backendNodeId: node.backendNodeId,
+        tag: node.tag,
+        rect: node.rect,
+        ...(node.localRect !== undefined ? { localRect: node.localRect } : {}),
+        ...(fingerprintAttrs ? { fingerprintAttrs } : {}),
+      };
+    }),
   );
 }
 
