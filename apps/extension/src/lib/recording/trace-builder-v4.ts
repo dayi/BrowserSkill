@@ -16,7 +16,9 @@ import { reduceTraceStepsV4 } from "./trace-reducer-v4";
 import { formatTraceStateBody } from "./trace-state-body";
 import type { RecordingDraftStep, StepAnnotation } from "./types";
 
-const DEFAULT_EFFECTS: RecordEffectKindV4[] = [
+/** Effects implemented by the P0 causal recorder. JavaScript profiler evidence
+ * remains intentionally deferred and is therefore never advertised here. */
+const SUPPORTED_EFFECTS: RecordEffectKindV4[] = [
   "dom",
   "network",
   "console",
@@ -24,6 +26,36 @@ const DEFAULT_EFFECTS: RecordEffectKindV4[] = [
   "security",
   "browser",
 ];
+
+function effectiveEffects(requested: RecordEffectKindV4[] | undefined): RecordEffectKindV4[] {
+  if (requested === undefined) return [...SUPPORTED_EFFECTS];
+  const supported = new Set<RecordEffectKindV4>(SUPPORTED_EFFECTS);
+  return [...new Set(requested.filter((kind) => supported.has(kind)))];
+}
+
+function filterEffects(effects: StepEffectsV4, enabled: Set<RecordEffectKindV4>): StepEffectsV4 {
+  return {
+    ...(enabled.has("dom") && effects.dom ? { dom: effects.dom } : {}),
+    ...(enabled.has("network") && effects.network?.length ? { network: effects.network } : {}),
+    ...(enabled.has("console") && effects.console?.length ? { console: effects.console } : {}),
+    ...(enabled.has("navigation") && effects.navigation?.length
+      ? { navigation: effects.navigation }
+      : {}),
+    ...(enabled.has("security") && effects.security?.length ? { security: effects.security } : {}),
+    ...(enabled.has("browser") && effects.browser?.length ? { browser: effects.browser } : {}),
+  };
+}
+
+function applyEffectFilter(
+  drafts: RecordingDraftStep[],
+  enabledKinds: RecordEffectKindV4[],
+): void {
+  const enabled = new Set(enabledKinds);
+  for (const draft of drafts) {
+    if (!draft.causal?.effects) continue;
+    draft.causal.effects = filterEffects(draft.causal.effects, enabled);
+  }
+}
 
 function publishedEntries(registry: RecordingStateRegistry, steps: StepV4[]): RecordedStateEntry[] {
   const entries = registry.values();
@@ -80,7 +112,12 @@ export function buildTraceV4(input: {
   captureEffects?: RecordEffectKindV4[];
   settleMaxMs?: number;
 }): TraceV4 {
+  const enabledEffects = effectiveEffects(input.captureEffects);
   attachSemanticChanges(input.registry, input.drafts);
+  // Filter before reduction so `result.observation` is derived from exactly
+  // the evidence that will be exported, rather than from hidden/discarded data.
+  applyEffectFilter(input.drafts, enabledEffects);
+
   const reduced = reduceTraceStepsV4(input.drafts, {
     startedAt: input.startedAt,
     includeTabSwitches: input.includeTabSwitches,
@@ -140,7 +177,7 @@ export function buildTraceV4(input: {
     },
     capture: {
       diagnostics: input.diagnostics ?? "standard",
-      effects: input.captureEffects?.length ? input.captureEffects : DEFAULT_EFFECTS,
+      effects: enabledEffects,
       ...(input.settleMaxMs !== undefined ? { settle_max_ms: input.settleMaxMs } : {}),
       ...(input.redactValues !== undefined ? { redact_values: input.redactValues } : {}),
     },
