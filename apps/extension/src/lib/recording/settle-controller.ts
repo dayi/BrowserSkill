@@ -1,6 +1,10 @@
 import type { CdpRunner, ChromeTabsApi } from "@/tools/shared";
+import type { RecordingCausalRuntime } from "./causal-runtime";
+import { waitForCompositeSettle } from "./composite-settle";
+import { activityDelta, type DocumentActivityManager } from "./document-activity";
 import { type DocumentSettleScope, waitForDocumentSettled } from "./document-settle";
 import { RecordingObservationSession } from "./observation-session";
+import type { SettleSummaryV4, StepEffectsV4 } from "./trace-v4-types";
 import type { RecordingDraftStep } from "./types";
 
 interface PendingSettle {
@@ -38,12 +42,35 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
+function mergeEffects(base: StepEffectsV4 | undefined, next: StepEffectsV4): StepEffectsV4 {
+  return {
+    ...(base ?? {}),
+    ...next,
+    ...(base?.network || next.network
+      ? { network: [...(base?.network ?? []), ...(next.network ?? [])] }
+      : {}),
+    ...(base?.console || next.console
+      ? { console: [...(base?.console ?? []), ...(next.console ?? [])] }
+      : {}),
+    ...(base?.security || next.security
+      ? { security: [...(base?.security ?? []), ...(next.security ?? [])] }
+      : {}),
+    ...(base?.navigation || next.navigation
+      ? { navigation: [...(base?.navigation ?? []), ...(next.navigation ?? [])] }
+      : {}),
+    ...(base?.browser || next.browser
+      ? { browser: [...(base?.browser ?? []), ...(next.browser ?? [])] }
+      : {}),
+  };
+}
+
 export function inferMissingPostStates(drafts: RecordingDraftStep[]): void {
   for (let index = 0; index < drafts.length - 1; index += 1) {
     const draft = drafts[index];
     const next = drafts[index + 1];
     if (draft && next && !draft.postStateId && next.preStateId) {
       draft.postStateId = next.preStateId;
+      draft.postCapturedAtMs = next.preCapturedAtMs;
     }
   }
 }
@@ -54,6 +81,9 @@ export class SettleController {
   readonly #tabsApi: ChromeTabsApi;
   readonly #tabId: number;
   readonly #rootScope: DocumentSettleScope;
+  readonly #causal?: RecordingCausalRuntime;
+  readonly #activity?: DocumentActivityManager;
+  readonly #settleMaxMs?: number;
   readonly #pending = new Map<number, PendingSettle>();
   #queue = Promise.resolve();
   #pendingRedirect: PendingRedirect | null = null;
@@ -64,12 +94,18 @@ export class SettleController {
     cdp: CdpRunner;
     tabsApi: ChromeTabsApi;
     tabId: number;
+    causal?: RecordingCausalRuntime;
+    activity?: DocumentActivityManager;
+    settleMaxMs?: number;
   }) {
     this.#session = input.session;
     this.#cdp = input.cdp;
     this.#tabsApi = input.tabsApi;
     this.#tabId = input.tabId;
     this.#rootScope = { target: { tabId: input.tabId } };
+    this.#causal = input.causal;
+    this.#activity = input.activity;
+    this.#settleMaxMs = input.settleMaxMs;
   }
 
   get hasPending(): boolean {
@@ -86,6 +122,40 @@ export class SettleController {
     }
   }
 
+  #finalizeCausalWindow(
+    draft: RecordingDraftStep,
+    settledEpochMs: number,
+    settle?: SettleSummaryV4,
+  ): void {
+    if (!draft.causal || !this.#causal) return;
+    const actionEpochMs = draft.causal.actionEpochMs ?? settledEpochMs;
+    draft.causal.eventToSeq = this.#causal.latestSeq(this.#tabId);
+    const effects = this.#causal.effectsForWindow({
+      tabId: this.#tabId,
+      actionEpochMs,
+      settledEpochMs,
+      ...(draft.causal.eventFromSeq !== undefined ? { fromSeq: draft.causal.eventFromSeq } : {}),
+      ...(draft.causal.eventToSeq !== undefined ? { toSeq: draft.causal.eventToSeq } : {}),
+    });
+    draft.causal.effects = mergeEffects(draft.causal.effects, effects);
+    if (settle) draft.causal.settle = settle;
+  }
+
+  #supersedeDraft(draft: RecordingDraftStep | undefined, next: RecordingDraftStep | undefined): void {
+    if (!draft?.causal) return;
+    const action = draft.causal.actionEpochMs ?? Date.now();
+    const end = next?.causal?.actionEpochMs ?? Date.now();
+    const settle: SettleSummaryV4 = {
+      reason: "superseded_by_next_action",
+      duration_ms: Math.max(0, end - action),
+      ...(this.#causal
+        ? { pending_relevant_requests: this.#causal.networkActivity(this.#tabId, end).pendingRelevantRequests }
+        : {}),
+    };
+    draft.postCapturedAtMs ??= next?.preCapturedAtMs;
+    this.#finalizeCausalWindow(draft, end, settle);
+  }
+
   schedule(
     drafts: RecordingDraftStep[],
     draftIndex: number,
@@ -96,14 +166,18 @@ export class SettleController {
         `settle scope tab ${scope.target.tabId} does not belong to tab ${this.#tabId}`,
       );
     }
-    const landing = drafts[draftIndex]?.preStateId;
+    const currentDraft = drafts[draftIndex];
+    const landing = currentDraft?.preStateId;
     for (const [index, pending] of this.#pending) {
       if (index >= draftIndex) continue;
       pending.abort.abort();
       this.#pending.delete(index);
-      if (landing && drafts[index] && !drafts[index].postStateId) {
-        drafts[index].postStateId = landing;
+      const previous = drafts[index];
+      if (landing && previous && !previous.postStateId) {
+        previous.postStateId = landing;
+        previous.postCapturedAtMs = currentDraft?.preCapturedAtMs;
       }
+      this.#supersedeDraft(previous, currentDraft);
     }
 
     this.#pending.get(draftIndex)?.abort.abort();
@@ -112,13 +186,54 @@ export class SettleController {
     const task = async () => {
       if (pending.abort.signal.aborted) return;
       try {
-        const outcome = await waitForDocumentSettled(this.#cdp, pending.scope, {
-          signal: pending.abort.signal,
-        });
-        if (outcome === "cancelled") return;
+        await this.#causal?.ensureTab(this.#tabId);
+        let settleSummary: SettleSummaryV4 | undefined;
+        if (this.#causal) {
+          const composite = await waitForCompositeSettle(this.#cdp, this.#causal, pending.scope, {
+            signal: pending.abort.signal,
+            ...(this.#settleMaxMs !== undefined ? { hardMaxMs: this.#settleMaxMs } : {}),
+          });
+          if (composite.reason === "cancelled") return;
+          settleSummary = composite.summary;
+        } else {
+          const outcome = await waitForDocumentSettled(this.#cdp, pending.scope, {
+            signal: pending.abort.signal,
+          });
+          if (outcome === "cancelled") return;
+        }
+
         const observation = await this.#captureWithRetry(pending.abort.signal);
         if (!pending.abort.signal.aborted && drafts[draftIndex]) {
-          drafts[draftIndex].postStateId = observation.stateId;
+          const draft = drafts[draftIndex]!;
+          draft.postStateId = observation.stateId;
+          draft.postCapturedAtMs = observation.capturedAtMs;
+          if (draft.causal && this.#activity) {
+            draft.causal.activityAfter = await this.#activity.read(pending.scope);
+            draft.causal.activityDelta = activityDelta(
+              draft.causal.activityBefore,
+              draft.causal.activityAfter,
+            );
+            const delta = draft.causal.activityDelta;
+            if (delta) {
+              const dom = {
+                mutation_count: delta.mutationCount,
+                ...(delta.activityDurationMs !== undefined
+                  ? { activity_duration_ms: delta.activityDurationMs }
+                  : {}),
+              };
+              draft.causal.effects = mergeEffects(draft.causal.effects, { dom });
+              if (settleSummary && delta.lastActivityEpochMs !== undefined) {
+                settleSummary.dom_quiet_ms = Math.max(0, observation.capturedAtMs - delta.lastActivityEpochMs);
+              }
+            }
+          }
+          this.#finalizeCausalWindow(
+            draft,
+            settleSummary
+              ? Math.min(observation.capturedAtMs, Date.now())
+              : observation.capturedAtMs,
+            settleSummary,
+          );
         }
       } catch (error) {
         if (!isAbortError(error)) {
@@ -159,7 +274,20 @@ export class SettleController {
     if (trailing.length === 0) return;
     try {
       const observation = await this.#captureWithRetry();
-      for (const draft of trailing) draft.postStateId = observation.stateId;
+      const now = observation.capturedAtMs;
+      for (const draft of trailing) {
+        draft.postStateId = observation.stateId;
+        draft.postCapturedAtMs = observation.capturedAtMs;
+        if (draft.causal && !draft.causal.settle) {
+          this.#finalizeCausalWindow(draft, now, {
+            reason: "unknown",
+            duration_ms: Math.max(0, now - (draft.causal.actionEpochMs ?? now)),
+            ...(this.#causal
+              ? { pending_relevant_requests: this.#causal.networkActivity(this.#tabId, now).pendingRelevantRequests }
+              : {}),
+          });
+        }
+      }
     } catch (error) {
       console.warn("[bsk record] final observation at stop failed", error);
     }
@@ -207,6 +335,7 @@ export class SettleController {
       return;
     }
 
+    const now = Date.now();
     const draft: RecordingDraftStep = {
       op: "navigate",
       url: finalUrl,
@@ -214,6 +343,11 @@ export class SettleController {
       cause: "browser",
       transitionQualifiers: ["server_redirect"],
       preStateId: this.#session.cursor.lastSettled?.stateId,
+      preCapturedAtMs: this.#session.cursor.lastSettled?.capturedAtMs,
+      causal: {
+        actionEpochMs: now,
+        receivedEpochMs: now,
+      },
     };
     drafts.push(draft);
     const draftIndex = drafts.length - 1;

@@ -82,15 +82,17 @@ export class RecordingObservationSession {
       title: captured.title,
       vomText: captured.vomText,
       truncated: captured.truncated,
+      capturedAtMs: captured.capturedAtMs,
     });
     const observation: RegisteredObservation = {
       stateId: state.id,
       rootFrameId: captured.rootFrameId,
       index: captured.index,
       url: captured.url,
+      capturedAtMs: captured.capturedAtMs,
     };
     this.cursor.lastSettled = observation;
-    this.cursor.lastCaptureAt = Date.now();
+    this.cursor.lastCaptureAt = captured.capturedAtMs;
     return observation;
   }
 
@@ -110,6 +112,7 @@ export class RecordingObservationSession {
     const unmatched = isTargeted(draft) && draft.matchedTarget?.unmatched === true;
     if (previousActionPending && unmatched) return;
     draft.preStateId = observation.stateId;
+    draft.preCapturedAtMs = observation.capturedAtMs;
     this.registry.markStep(observation.stateId, draftId);
 
     if (!isTargeted(draft) || !draft.matchedTarget?.ref) return;

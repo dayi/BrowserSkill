@@ -1,5 +1,7 @@
 import type { CdpRunner, ChromeTabsApi } from "@/tools/shared";
 import type { StopReason, TraceV3 } from "@/transport/types";
+import type { RecordingCausalRuntime } from "./causal-runtime";
+import { DocumentActivityManager } from "./document-activity";
 import { type DocumentSettleScope, waitForDocumentSettled } from "./document-settle";
 import type { RegisteredObservation } from "./observation-capture";
 import { RecordingObservationSession } from "./observation-session";
@@ -29,17 +31,29 @@ export class RecordingObservationRuntime {
   readonly #contexts = new Map<number, TabRecordingContext>();
   readonly #maxTokens?: number;
   readonly #redactValues: boolean;
+  readonly #causal?: RecordingCausalRuntime;
+  readonly #activity?: DocumentActivityManager;
+  readonly #settleMaxMs?: number;
 
   constructor(input: {
     cdp: CdpRunner;
     tabsApi: ChromeTabsApi;
     maxTokens?: number;
     redactValues?: boolean;
+    causal?: RecordingCausalRuntime;
+    settleMaxMs?: number;
   }) {
     this.#cdp = input.cdp;
     this.#tabsApi = input.tabsApi;
     this.#maxTokens = input.maxTokens;
     this.#redactValues = input.redactValues ?? false;
+    this.#causal = input.causal;
+    this.#activity = input.causal ? new DocumentActivityManager(input.cdp) : undefined;
+    this.#settleMaxMs = input.settleMaxMs;
+  }
+
+  #rootScope(tabId: number): DocumentSettleScope {
+    return { target: { tabId } };
   }
 
   #context(tabId: number): TabRecordingContext {
@@ -58,6 +72,9 @@ export class RecordingObservationRuntime {
         cdp: this.#cdp,
         tabsApi: this.#tabsApi,
         tabId,
+        ...(this.#causal ? { causal: this.#causal } : {}),
+        ...(this.#activity ? { activity: this.#activity } : {}),
+        ...(this.#settleMaxMs !== undefined ? { settleMaxMs: this.#settleMaxMs } : {}),
       }),
       pendingCapture: null,
       frameRefresh: Promise.resolve(),
@@ -73,7 +90,22 @@ export class RecordingObservationRuntime {
 
     const abort = new AbortController();
     let pending!: PendingCapture;
-    const promise = context.session.capture(this.#cdp, this.#tabsApi, tabId, abort.signal);
+    const promise = (async () => {
+      const rootScope = this.#rootScope(tabId);
+      await this.#causal?.ensureTab(tabId);
+      // Install the long-lived activity observer before the state capture. It
+      // remains active until navigation and therefore sees synchronous changes
+      // caused by the next user action.
+      await this.#activity?.ensure(rootScope);
+      const observation = await context.session.capture(
+        this.#cdp,
+        this.#tabsApi,
+        tabId,
+        abort.signal,
+      );
+      await this.#activity?.read(rootScope);
+      return observation;
+    })();
     pending = {
       abort,
       promise: promise.finally(() => {
@@ -108,6 +140,7 @@ export class RecordingObservationRuntime {
       if (abort.signal.aborted) return;
       const scope = context.session.cursor.lastSettled?.index.documentScope(producerId);
       if (scope) {
+        await this.#activity?.ensure(scope);
         await waitForDocumentSettled(this.#cdp, scope, { signal: abort.signal });
       }
       if (abort.signal.aborted) return;
@@ -115,6 +148,7 @@ export class RecordingObservationRuntime {
       // Capture again after the child SPA is quiet so the next action can be
       // matched against refs that actually exist in its pre-action state.
       await this.#capture(tabId);
+      if (scope) await this.#activity?.read(scope);
     })();
     const tracked = refresh.catch(() => {});
     context.frameRefresh = tracked;
@@ -128,7 +162,13 @@ export class RecordingObservationRuntime {
   async captureTabTransition(
     fromTabId: number,
     toTabId: number,
-  ): Promise<{ preStateId?: string; postStateId?: string; targetUrl?: string }> {
+  ): Promise<{
+    preStateId?: string;
+    postStateId?: string;
+    targetUrl?: string;
+    preCapturedAtMs?: number;
+    postCapturedAtMs?: number;
+  }> {
     const from = this.#context(fromTabId);
     await this.#flushContext(from);
     if (!from.session.cursor.lastSettled) {
@@ -149,8 +189,16 @@ export class RecordingObservationRuntime {
 
     const source = from.session.cursor.lastSettled;
     return {
-      ...(source ? { preStateId: source.stateId } : {}),
-      ...(target ? { postStateId: target.stateId, targetUrl: target.url } : {}),
+      ...(source
+        ? { preStateId: source.stateId, preCapturedAtMs: source.capturedAtMs }
+        : {}),
+      ...(target
+        ? {
+            postStateId: target.stateId,
+            postCapturedAtMs: target.capturedAtMs,
+            targetUrl: target.url,
+          }
+        : {}),
     };
   }
 
@@ -180,6 +228,7 @@ export class RecordingObservationRuntime {
     const scope = producerId
       ? context.session.cursor.lastSettled?.index.documentScope(producerId)
       : undefined;
+    const settleScope = scope ?? this.#rootScope(tabId);
     if (
       producerId &&
       (draft.op === "click" ||
@@ -194,8 +243,15 @@ export class RecordingObservationRuntime {
         geometrySpace: "local",
       };
     }
+    if (draft.causal) {
+      await this.#causal?.ensureTab(tabId);
+      // Never install a new probe after the action merely to manufacture a
+      // baseline: last() is intentionally null when no pre-action observation
+      // prepared this Document.
+      draft.causal.activityBefore = this.#activity?.last(settleScope) ?? null;
+    }
     context.session.bindDraft(draft, draftIndex + 1, context.settle.hasPending);
-    context.settle.schedule(drafts, draftIndex, scope);
+    context.settle.schedule(drafts, draftIndex, settleScope);
   }
 
   scheduleSettle(
@@ -250,6 +306,7 @@ export class RecordingObservationRuntime {
       context.pendingCapture?.abort.abort();
       context.settle.cancel();
     }
+    this.#activity?.clear();
   }
 
   buildTrace(input: {
@@ -273,5 +330,18 @@ export class RecordingObservationRuntime {
       redactValues: this.#redactValues,
       includeTabSwitches: input.includeTabSwitches,
     });
+  }
+
+  /** Internal state registry used by the version-specific trace builder. */
+  get registry(): RecordingStateRegistry {
+    return this.#registry;
+  }
+
+  get annotations(): readonly StepAnnotation[] {
+    return this.#annotations;
+  }
+
+  get redactValues(): boolean {
+    return this.#redactValues;
   }
 }

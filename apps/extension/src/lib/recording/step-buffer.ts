@@ -20,20 +20,30 @@ function toDraftStep(
   targetHint?: TargetMatchHint,
 ): RecordingDraftStep | null {
   const pageUrl = payload.page_url;
+  const receivedEpochMs = Date.now();
+  const causal = {
+    actionEpochMs: payload.timing?.event_epoch_ms ?? receivedEpochMs,
+    receivedEpochMs,
+  };
   const common = {
     ...(pageUrl ? { pageUrl } : {}),
     ...(targetHint ? { targetHint } : {}),
+    causal,
+  };
+  const target = {
+    ...(payload.target ? { captureTarget: payload.target } : {}),
+    ...(payload.fingerprint ? { fingerprint: payload.fingerprint } : {}),
   };
   switch (payload.op) {
     case "click":
-      return payload.target ? { op: "click", captureTarget: payload.target, ...common } : null;
+      return payload.target ? { op: "click", ...target, ...common } : null;
     case "hover":
-      return payload.target ? { op: "hover", captureTarget: payload.target, ...common } : null;
+      return payload.target ? { op: "hover", ...target, ...common } : null;
     case "fill":
       return payload.target
         ? {
             op: "fill",
-            captureTarget: payload.target,
+            ...target,
             value: payload.value ?? "",
             ...(payload.commit ? { commit: payload.commit } : {}),
             ...(payload.redacted ? { redacted: true } : {}),
@@ -45,7 +55,7 @@ function toDraftStep(
         ? {
             op: "press",
             key: payload.key,
-            ...(payload.target ? { captureTarget: payload.target } : {}),
+            ...target,
             ...(payload.modifiers?.length ? { modifiers: payload.modifiers } : {}),
             ...common,
           }
@@ -54,7 +64,7 @@ function toDraftStep(
       return payload.target && payload.values
         ? {
             op: "select",
-            captureTarget: payload.target,
+            ...target,
             values: payload.values,
             ...(payload.labels?.length ? { labels: payload.labels } : {}),
             ...common,
@@ -93,6 +103,7 @@ export function observeRecordedNavigation(
 ): NavigationObserveResult {
   const navigation = buffer.navigation;
   if (!url || url === navigation.currentUrl) return { kind: "noop" };
+  const previousUrl = navigation.currentUrl;
   navigation.currentUrl = url;
 
   const pendingIsCurrent =
@@ -113,12 +124,20 @@ export function observeRecordedNavigation(
   if (hasRedirectQualifier(transitionQualifiers)) {
     return { kind: "coalesce_redirect", url };
   }
+  const now = Date.now();
   buffer.steps.push({
     op: "navigate",
     url,
     pageUrl: url,
     transitionType,
     transitionQualifiers,
+    causal: {
+      actionEpochMs: now,
+      receivedEpochMs: now,
+      ...(previousUrl && previousUrl !== url
+        ? { effects: { navigation: [{ from: previousUrl, to: url }] } }
+        : {}),
+    },
   });
   return { kind: "appended", index: buffer.steps.length - 1 };
 }

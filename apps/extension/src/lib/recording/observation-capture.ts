@@ -20,6 +20,7 @@ export interface CapturedRecordingObservation {
   title?: string;
   vomText: string;
   truncated: boolean;
+  capturedAtMs: number;
 }
 
 export interface RegisteredObservation {
@@ -27,6 +28,7 @@ export interface RegisteredObservation {
   rootFrameId: string;
   index: ObservationNodeIndex;
   url: string;
+  capturedAtMs: number;
 }
 
 export interface RecordingDocumentScope {
@@ -45,6 +47,7 @@ function frameTagKey(frameId: string, tag: string): string {
 export class ObservationNodeIndex {
   readonly #nodesByFrameTag = new Map<string, IndexedObservationNode[]>();
   readonly #refById = new Map<string, RenderedRef>();
+  readonly #nodeByRefId = new Map<string, IndexedObservationNode>();
   readonly #refsByFrame = new Map<string, RenderedRef[]>();
   readonly #scopeByProducer = new Map<string, RecordingDocumentScope | null>();
 
@@ -73,11 +76,12 @@ export class ObservationNodeIndex {
     }
     for (const geometry of input.matchNodes) {
       const { frameId } = geometry;
-      const entry = {
+      const entry: IndexedObservationNode = {
         frameId,
         geometry,
         ref: refByNode.get(nodeKey(frameId, geometry.backendNodeId)),
       };
+      if (entry.ref) this.#nodeByRefId.set(entry.ref.ref, entry);
       const key = frameTagKey(frameId, geometry.tag);
       const bucket = this.#nodesByFrameTag.get(key) ?? [];
       bucket.push(entry);
@@ -91,6 +95,10 @@ export class ObservationNodeIndex {
 
   ref(refId: string): RenderedRef | undefined {
     return this.#refById.get(refId);
+  }
+
+  nodeForRef(refId: string): IndexedObservationNode | undefined {
+    return this.#nodeByRefId.get(refId);
   }
 
   refs(frameId: string): readonly RenderedRef[] {
@@ -136,5 +144,6 @@ export async function captureRecordingObservation(input: {
     title,
     vomText: captured.text,
     truncated: captured.truncated,
+    capturedAtMs: Date.now(),
   };
 }

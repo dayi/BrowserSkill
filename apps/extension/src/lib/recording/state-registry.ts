@@ -5,6 +5,8 @@ export interface RecordedStateEntry {
   /** Rendered VOM text; capture indexes and source DOM/AX data never enter the registry. */
   vomText: string;
   truncated: boolean;
+  /** First time this semantic state identity was captured in this recording. */
+  capturedAtMs: number;
   stepsHere: number[];
 }
 
@@ -22,6 +24,7 @@ export class RecordingStateRegistry {
     title?: string;
     vomText: string;
     truncated?: boolean;
+    capturedAtMs?: number;
   }): RecordedStateEntry {
     const identity = stateIdentity(input.url, input.vomText);
     const existingId = this.#idByIdentity.get(identity);
@@ -38,6 +41,7 @@ export class RecordingStateRegistry {
       ...(input.title ? { title: input.title } : {}),
       vomText: input.vomText,
       truncated: input.truncated ?? false,
+      capturedAtMs: input.capturedAtMs ?? Date.now(),
       stepsHere: [],
     };
     this.#nextId += 1;
@@ -48,6 +52,10 @@ export class RecordingStateRegistry {
 
   values(): RecordedStateEntry[] {
     return [...this.#entriesById.values()];
+  }
+
+  get(stateId: string): RecordedStateEntry | undefined {
+    return this.#entriesById.get(stateId);
   }
 
   markStep(stateId: string, draftId: number): void {

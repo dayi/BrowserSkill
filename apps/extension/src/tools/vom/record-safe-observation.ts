@@ -14,7 +14,21 @@ export interface CaptureVomFrame {
   recordingDocumentId?: string;
 }
 
-/** Allowlisted geometry used to match a recorded action to a rendered ref. */
+/** Strict allow-list of non-value DOM attributes safe to retain for replay identity. */
+export interface CaptureVomFingerprintAttrs {
+  id?: string;
+  name?: string;
+  input_type?: string;
+  test_id?: string;
+  data_test?: string;
+  data_cy?: string;
+  aria_label?: string;
+  aria_controls?: string;
+  aria_haspopup?: string;
+  placeholder?: string;
+}
+
+/** Allowlisted geometry + identity hints used to match a recorded action to a rendered ref. */
 export interface CaptureVomMatchNode {
   frameId: string;
   backendNodeId: number;
@@ -23,6 +37,8 @@ export interface CaptureVomMatchNode {
   rect: Rect | null;
   /** Frame-local viewport-relative geometry, when available. */
   localRect?: Rect | null;
+  /** No input value/textContent/class/style/href is exposed here. */
+  fingerprintAttrs?: CaptureVomFingerprintAttrs;
 }
 
 /**
@@ -69,6 +85,31 @@ function projectFrames(documents: CapturedFrameDocument<FrameAxNode>[]): Capture
   });
 }
 
+function nonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+function projectFingerprintAttrs(attrs: Record<string, string>): CaptureVomFingerprintAttrs | undefined {
+  const projected: CaptureVomFingerprintAttrs = {
+    ...(nonEmpty(attrs.id) ? { id: nonEmpty(attrs.id) } : {}),
+    ...(nonEmpty(attrs.name) ? { name: nonEmpty(attrs.name) } : {}),
+    ...(nonEmpty(attrs.type) ? { input_type: nonEmpty(attrs.type)?.toLowerCase() } : {}),
+    ...(nonEmpty(attrs["data-testid"]) ? { test_id: nonEmpty(attrs["data-testid"]) } : {}),
+    ...(nonEmpty(attrs["data-test"]) ? { data_test: nonEmpty(attrs["data-test"]) } : {}),
+    ...(nonEmpty(attrs["data-cy"]) ? { data_cy: nonEmpty(attrs["data-cy"]) } : {}),
+    ...(nonEmpty(attrs["aria-label"]) ? { aria_label: nonEmpty(attrs["aria-label"]) } : {}),
+    ...(nonEmpty(attrs["aria-controls"])
+      ? { aria_controls: nonEmpty(attrs["aria-controls"]) }
+      : {}),
+    ...(nonEmpty(attrs["aria-haspopup"])
+      ? { aria_haspopup: nonEmpty(attrs["aria-haspopup"]) }
+      : {}),
+    ...(nonEmpty(attrs.placeholder) ? { placeholder: nonEmpty(attrs.placeholder) } : {}),
+  };
+  return Object.keys(projected).length ? projected : undefined;
+}
+
 function projectMatchNodes(documents: CapturedFrameDocument<FrameAxNode>[]): CaptureVomMatchNode[] {
   return documents.flatMap((document) =>
     document.domNodes.map((node) => ({
@@ -77,6 +118,9 @@ function projectMatchNodes(documents: CapturedFrameDocument<FrameAxNode>[]): Cap
       tag: node.tag,
       rect: node.rect,
       ...(node.localRect !== undefined ? { localRect: node.localRect } : {}),
+      ...(projectFingerprintAttrs(node.attrs)
+        ? { fingerprintAttrs: projectFingerprintAttrs(node.attrs) }
+        : {}),
     })),
   );
 }

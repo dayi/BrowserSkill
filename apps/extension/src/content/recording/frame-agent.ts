@@ -13,6 +13,7 @@ import {
   type RecordFrameQueryResponse,
   type RecordFrameStartMessage,
 } from "@/lib/recording/frame-bridge";
+import { fingerprintFromCaptureTarget } from "@/lib/recording/target-fingerprint";
 import { type RecordCaptureController, startRecordCapture } from "../record-capture";
 import { RecordStepDelivery } from "../record-step-delivery";
 
@@ -91,7 +92,18 @@ export class RecordFrameAgent {
       message.requestId,
       (step) => {
         marker.ensure();
-        delivery.enqueue(step);
+        // The callback is invoked synchronously from the capture-phase listener.
+        // Stamp the action here so background/service-worker latency cannot move
+        // the causal-window start past synchronous DOM/network side effects.
+        const eventEpochMs = Date.now();
+        delivery.enqueue({
+          ...step,
+          fingerprint: step.fingerprint ?? fingerprintFromCaptureTarget(step.target),
+          timing: step.timing ?? {
+            event_epoch_ms: eventEpochMs,
+            event_offset_ms: eventEpochMs - message.startedAtMs,
+          },
+        });
       },
       { captureNavigation: window.top === window },
     );
