@@ -10,7 +10,7 @@ interface FakeCdp {
 
 function fakeCdp(): FakeCdp {
   let handler: ((source: CdpDebuggee, method: string, params: unknown) => void) | undefined;
-  const send: CdpRunner["send"] = async () => ({}) as never;
+  const send = async <T = unknown>(): Promise<T> => ({}) as T;
   const cdp: CdpRunner = {
     send,
     onEvent(next) {
