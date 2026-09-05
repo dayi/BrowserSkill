@@ -161,6 +161,8 @@ export class RecordingCausalRuntime {
   readonly #pendingRelevant = new Map<number, Set<string>>();
   readonly #lastNetworkActivity = new Map<number, number>();
   readonly #enabledTabs = new Set<number>();
+  readonly #mainFrameIds = new Map<number, string>();
+  readonly #mainFrameUrls = new Map<number, string>();
   readonly #subscription: { dispose(): void } | null;
 
   constructor(cdp: CdpRunner) {
@@ -172,9 +174,21 @@ export class RecordingCausalRuntime {
   async ensureTab(tabId: number): Promise<void> {
     if (this.#enabledTabs.has(tabId)) return;
     this.#enabledTabs.add(tabId);
-    // send() ensures attachment; the ChromiumCdp attach path already enables
+    // send() ensures attachment; ChromiumCdp attach already enables
     // Network/Runtime/Log. Audits is best effort because not all targets expose it.
     await this.#cdp.send(tabId, "Audits.enable", {}).catch(() => {});
+    // Seed the main-frame URL before the next action. This lets the first
+    // Page.frameNavigated event after a click carry an explicit from -> to edge.
+    try {
+      const tree = await this.#cdp.send<{
+        frameTree?: { frame?: { id?: string; url?: string } };
+      }>(tabId, "Page.getFrameTree", {});
+      const frame = tree.frameTree?.frame;
+      if (frame?.id) this.#mainFrameIds.set(tabId, frame.id);
+      if (frame?.url) this.#mainFrameUrls.set(tabId, sanitizeRecordedUrl(frame.url));
+    } catch {
+      // Navigation events can establish the baseline later.
+    }
   }
 
   latestSeq(tabId: number): number {
@@ -205,7 +219,10 @@ export class RecordingCausalRuntime {
     const navigation: NavigationEffectV4[] = [];
 
     for (const event of events) {
-      if ((event.kind === "network_finished" || event.kind === "network_failure") && network.length < MAX_EFFECTS_PER_KIND) {
+      if (
+        (event.kind === "network_finished" || event.kind === "network_failure") &&
+        network.length < MAX_EFFECTS_PER_KIND
+      ) {
         const data = event.data as NetworkTerminalData;
         network.push({
           method: data.request.method,
@@ -217,11 +234,19 @@ export class RecordingCausalRuntime {
           ...(data.durationMs !== undefined ? { duration_ms: Math.max(0, data.durationMs) } : {}),
           ...(data.request.initiator.length ? { initiator: data.request.initiator } : {}),
         });
-      } else if ((event.kind === "console" || event.kind === "exception") && consoleEffects.length < MAX_EFFECTS_PER_KIND) {
+      } else if (
+        (event.kind === "console" || event.kind === "exception") &&
+        consoleEffects.length < MAX_EFFECTS_PER_KIND
+      ) {
         const data = event.data as ConsoleEffectV4;
         // Keep errors/warnings/exceptions in the compact trace; normal log chatter
         // remains only in the bounded journal and is discarded at trace export.
-        if (event.kind === "exception" || data.level === "error" || data.level === "warning" || data.level === "warn") {
+        if (
+          event.kind === "exception" ||
+          data.level === "error" ||
+          data.level === "warning" ||
+          data.level === "warn"
+        ) {
           consoleEffects.push(data);
         }
       } else if (event.kind === "security" && security.length < MAX_EFFECTS_PER_KIND) {
@@ -248,6 +273,8 @@ export class RecordingCausalRuntime {
     this.#pendingRelevant.clear();
     this.#lastNetworkActivity.clear();
     this.#enabledTabs.clear();
+    this.#mainFrameIds.clear();
+    this.#mainFrameUrls.clear();
     this.journal.clear();
   }
 
@@ -281,6 +308,41 @@ export class RecordingCausalRuntime {
     else this.#pendingRelevant.delete(tabId);
   }
 
+  #appendNavigation(source: CdpDebuggee, frameId: string | undefined, toRaw: string): void {
+    const tabId = source.tabId;
+    if (typeof tabId !== "number") return;
+    const to = sanitizeRecordedUrl(toRaw);
+    const from = this.#mainFrameUrls.get(tabId);
+    if (frameId) this.#mainFrameIds.set(tabId, frameId);
+    this.#mainFrameUrls.set(tabId, to);
+    if (!from || from === to) return;
+    this.#append(source, "browser", { type: "navigation", from, to }, Date.now(), frameId);
+  }
+
+  #finishRedirectLeg(
+    source: CdpDebuggee,
+    state: NetworkRequestState,
+    redirectResponse: Record<string, unknown>,
+    endProtocolTimestamp: number | undefined,
+  ): void {
+    const status = typeof redirectResponse.status === "number" ? redirectResponse.status : state.status;
+    const durationMs =
+      endProtocolTimestamp !== undefined && state.startedProtocolTimestamp !== undefined
+        ? (endProtocolTimestamp - state.startedProtocolTimestamp) * 1000
+        : Date.now() - state.startedEpochMs;
+    this.#append(
+      source,
+      "network_finished",
+      {
+        request: state,
+        ...(status !== undefined ? { status } : {}),
+        durationMs,
+      } satisfies NetworkTerminalData,
+      Date.now(),
+      state.frameId,
+    );
+  }
+
   #onCdpEvent(source: CdpDebuggee, method: string, params: unknown): void {
     const tabId = source.tabId;
     if (typeof tabId !== "number") return;
@@ -292,8 +354,17 @@ export class RecordingCausalRuntime {
       if (!requestId || typeof request.url !== "string") return;
       const resourceType = typeof raw.type === "string" ? raw.type : undefined;
       const key = sourceKey(source, requestId);
-      const startedEpochMs =
-        typeof raw.wallTime === "number" ? raw.wallTime * 1000 : Date.now();
+      const previous = this.#requests.get(key);
+      const redirectResponse = raw.redirectResponse as Record<string, unknown> | undefined;
+      if (previous && redirectResponse) {
+        this.#finishRedirectLeg(
+          source,
+          previous,
+          redirectResponse,
+          typeof raw.timestamp === "number" ? raw.timestamp : undefined,
+        );
+      }
+      const startedEpochMs = typeof raw.wallTime === "number" ? raw.wallTime * 1000 : Date.now();
       const state: NetworkRequestState = {
         key,
         tabId,
@@ -321,10 +392,16 @@ export class RecordingCausalRuntime {
       const response = (raw.response ?? {}) as Record<string, unknown>;
       if (typeof response.status === "number") state.status = response.status;
       this.#lastNetworkActivity.set(tabId, Date.now());
-      this.#append(source, "network_response", {
-        request: state,
-        ...(state.status !== undefined ? { status: state.status } : {}),
-      }, Date.now(), state.frameId);
+      this.#append(
+        source,
+        "network_response",
+        {
+          request: state,
+          ...(state.status !== undefined ? { status: state.status } : {}),
+        },
+        Date.now(),
+        state.frameId,
+      );
       return;
     }
 
@@ -363,12 +440,16 @@ export class RecordingCausalRuntime {
           corsError: raw.corsErrorStatus,
         });
         if (code) {
-          this.#append(source, "security", {
-            code,
-            ...(data.errorText ? { message: truncate(data.errorText) } : {}),
-            source: "network",
-            confidence: "explicit",
-          } satisfies SecurityEffectV4);
+          this.#append(
+            source,
+            "security",
+            {
+              code,
+              ...(data.errorText ? { message: truncate(data.errorText) } : {}),
+              source: "network",
+              confidence: "explicit",
+            } satisfies SecurityEffectV4,
+          );
         }
       }
       return;
@@ -378,11 +459,16 @@ export class RecordingCausalRuntime {
       const level = typeof raw.type === "string" ? raw.type : "log";
       const args = Array.isArray(raw.args) ? raw.args : [];
       const text = truncate(args.map(consoleArgText).filter(Boolean).join(" ")) ?? "";
-      this.#append(source, "console", {
-        level,
-        text,
-        ...(stackFrames(raw.stackTrace).length ? { stack_trace: stackFrames(raw.stackTrace) } : {}),
-      } satisfies ConsoleEffectV4);
+      const stack = stackFrames(raw.stackTrace);
+      this.#append(
+        source,
+        "console",
+        {
+          level,
+          text,
+          ...(stack.length ? { stack_trace: stack } : {}),
+        } satisfies ConsoleEffectV4,
+      );
       return;
     }
 
@@ -394,11 +480,15 @@ export class RecordingCausalRuntime {
         truncate(typeof details.text === "string" ? details.text : undefined) ??
         "Uncaught exception";
       const stack = stackFrames(details.stackTrace);
-      this.#append(source, "exception", {
-        level: "error",
-        text,
-        ...(stack.length ? { stack_trace: stack } : {}),
-      } satisfies ConsoleEffectV4);
+      this.#append(
+        source,
+        "exception",
+        {
+          level: "error",
+          text,
+          ...(stack.length ? { stack_trace: stack } : {}),
+        } satisfies ConsoleEffectV4,
+      );
       return;
     }
 
@@ -407,34 +497,51 @@ export class RecordingCausalRuntime {
       const level = typeof entry.level === "string" ? entry.level : "log";
       const text = truncate(typeof entry.text === "string" ? entry.text : undefined) ?? "";
       const stack = stackFrames(entry.stackTrace);
-      this.#append(source, "console", {
-        level,
-        text,
-        ...(stack.length ? { stack_trace: stack } : {}),
-      } satisfies ConsoleEffectV4);
+      this.#append(
+        source,
+        "console",
+        {
+          level,
+          text,
+          ...(stack.length ? { stack_trace: stack } : {}),
+        } satisfies ConsoleEffectV4,
+      );
       return;
     }
 
     if (method === "Audits.issueAdded") {
       const issue = (raw.issue ?? {}) as Record<string, unknown>;
       const code = typeof issue.code === "string" ? issue.code : "UnknownIssue";
-      this.#append(source, "security", {
-        code: auditSecurityCode(code),
-        message: truncate(code),
-        source: "audits",
-        confidence: "explicit",
-      } satisfies SecurityEffectV4);
+      this.#append(
+        source,
+        "security",
+        {
+          code: auditSecurityCode(code),
+          message: truncate(code),
+          source: "audits",
+          confidence: "explicit",
+        } satisfies SecurityEffectV4,
+      );
       return;
     }
 
     if (method === "Page.frameNavigated") {
       const frame = (raw.frame ?? {}) as Record<string, unknown>;
-      const url = typeof frame.url === "string" ? sanitizeRecordedUrl(frame.url) : undefined;
+      // Only main-frame navigation belongs to the tab-level business state.
+      if (typeof frame.parentId === "string") return;
+      const url = typeof frame.url === "string" ? frame.url : undefined;
       if (!url) return;
-      this.#append(source, "browser", {
-        type: "navigation_seen",
-        to: url,
-      });
+      const frameId = typeof frame.id === "string" ? frame.id : undefined;
+      this.#appendNavigation(source, frameId, url);
+      return;
+    }
+
+    if (method === "Page.navigatedWithinDocument") {
+      const frameId = typeof raw.frameId === "string" ? raw.frameId : undefined;
+      const mainFrameId = this.#mainFrameIds.get(tabId);
+      if (mainFrameId && frameId && mainFrameId !== frameId) return;
+      const url = typeof raw.url === "string" ? raw.url : undefined;
+      if (url) this.#appendNavigation(source, frameId, url);
     }
   }
 }
